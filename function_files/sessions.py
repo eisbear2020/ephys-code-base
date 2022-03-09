@@ -19,9 +19,9 @@
 ########################################################################################################################
 
 import importlib
-from function_files.single_phase import Sleep, Exploration, TwoPopSleep, TwoPopExploration, Cheeseboard
+from function_files.single_phase import Sleep, Exploration, TwoPopSleep, Cheeseboard, CrossMaze
 from function_files.multiple_phases import MultPhasesOnePopulation, MultPhasesTwoPopulations, LongSleep, \
-     PrePostCheeseboard, ExplorationNovelFamiliar, PreLongSleepPost, ExplFamPrePostCheeseboardExplFam, AllData, \
+     PrePostCheeseboard, ExplorationNovelFamiliar, PreSleepPost, ExplFamPrePostCheeseboardExplFam, AllData, \
      PreProbPrePostPostProb, SleepBeforeSleep, SleepBeforePreSleep
 from function_files.load_data import LoadData
 from function_files.support_functions import moving_average
@@ -57,7 +57,6 @@ class SingleSession:
     def load_data(self, experiment_phase, data_to_use):
         data_obj = LoadData(session_name=self.session_name,
                             experiment_phase=experiment_phase,
-                            cell_type=self.cell_type,
                             pre_proc_dir=self.params.pre_proc_dir)
         # write experiment phase id (_1, _2, ..) and experiment_phase data to params
         self.session_params.experiment_phase_id = data_obj.get_experiment_phase_id()
@@ -76,7 +75,6 @@ class SingleSession:
 
         data_obj = LoadData(session_name=self.session_name,
                             experiment_phase=experiment_phase,
-                            cell_type=self.cell_type,
                             pre_proc_dir=self.params.pre_proc_dir)
         # write experiment phase id (_1, _2, ..) and experiment_phase data to params
         self.session_params.experiment_phase_id = data_obj.get_experiment_phase_id()
@@ -85,7 +83,7 @@ class SingleSession:
         return data_obj
 
     """#################################################################################################################
-    #  analyzing single experiment phase "long_sleep_experiment_phases"
+    #  analyzing single experiment phase for one population
     #################################################################################################################"""
 
     def sleep(self, experiment_phase, data_to_use="std"):
@@ -109,6 +107,13 @@ class SingleSession:
         return Cheeseboard(data_dic=data_dic, cell_type=self.cell_type, params=self.params,
                            session_params=self.session_params, experiment_phase=experiment_phase)
 
+    def cross_maze(self, experiment_phase, data_to_use="std"):
+
+        data_dic = self.load_data(experiment_phase=experiment_phase, data_to_use=data_to_use)
+
+        return CrossMaze(data_dic=data_dic, cell_type=self.cell_type, params=self.params,
+                           session_params=self.session_params, experiment_phase=experiment_phase)
+
     """#################################################################################################################
     #  analyzing multiple experiment phases
     #################################################################################################################"""
@@ -121,7 +126,8 @@ class SingleSession:
             long_sleep_exp_phases = [long_sleep_exp_phases[subset_of_sleep]]
         data_obj = self.load_data_object(experiment_phase=long_sleep_exp_phases)
         self.params.data_to_use = data_to_use
-        return LongSleep(sleep_data_obj=data_obj, params=self.params, session_params=self.session_params)
+        return LongSleep(sleep_data_obj=data_obj, params=self.params, session_params=self.session_params,
+                         cell_type=self.cell_type)
 
     def pre_post_cheeseboard(self, data_to_use="std"):
 
@@ -168,16 +174,15 @@ class SingleSession:
         return PreProbPrePostPostProb(pre_probe=pre_probe, pre=pre, post=post, post_probe=post_probe,
                                                 params=self.params, session_params=self.session_params)
 
-    def pre_long_sleep_post(self, data_to_use="std"):
+    def pre_sleep_post(self, data_to_use="std", pre=["cross_maze_task_1"], post=["cross_maze_task_2"], sleep=["sleep_1"]):
         # get pre and post phase
-        pre = self.cheese_board(experiment_phase=["learning_cheeseboard_1"])
-        post = self.cheese_board(experiment_phase=["learning_cheeseboard_2"])
+        pre = self.cross_maze(experiment_phase=pre)
+        post = self.cross_maze(experiment_phase=post)
+        sleep = self.sleep(experiment_phase=sleep)
         # get all experiment phases that define long sleep
-        long_sleep_exp_phases = self.session_params.long_sleep_experiment_phases
-        sleep_data_obj = self.load_data_object(experiment_phase=long_sleep_exp_phases)
         self.params.data_to_use = data_to_use
         self.params.session_name = self.session_name
-        return PreLongSleepPost(sleep_data_obj=sleep_data_obj, pre=pre, post=post, params=self.params,
+        return PreSleepPost(sleep=sleep, pre=pre, post=post, params=self.params,
                                 session_params=self.session_params)
 
     def novel_fam(self):
@@ -193,6 +198,66 @@ class SingleSession:
 
         return AllData(params=self.params, session_params=self.session_params)
 
+
+class TwoPopSingleSession:
+    """class for single session"""
+
+    def __init__(self, session_name, cell_type_1, cell_type_2, params):
+        # --------------------------------------------------------------------------------------------------------------
+        # args: - session_name, str: name of session
+        # --------------------------------------------------------------------------------------------------------------
+
+        # import analysis parameters that are specific for the current session
+        # --------------------------------------------------------------------------------------------------------------
+        session_parameter_file = importlib.import_module("parameter_files." + session_name)
+
+        self.session_params = session_parameter_file.SessionParameters()
+
+        self.cell_type_1 = cell_type_1
+        self.cell_type_2 = cell_type_2
+        self.session_name = session_name
+        self.params = params
+        self.params.cell_type_1 = cell_type_1
+        self.params.cell_type_2 = cell_type_2
+
+    def load_data(self, experiment_phase, data_to_use):
+        data_obj = LoadData(session_name=self.session_name,
+                            experiment_phase=experiment_phase,
+                            pre_proc_dir=self.params.pre_proc_dir)
+        # write experiment phase id (_1, _2, ..) and experiment_phase data to params
+        self.session_params.experiment_phase_id = data_obj.get_experiment_phase_id()
+        self.session_params.experiment_phase = data_obj.get_experiment_phase()
+
+        # check whether standard or extended data (incl. lfp) needs to be used
+        if data_to_use == "std":
+            data_dic = data_obj.get_standard_data()
+            self.params.data_to_use = "std"
+        elif data_to_use == "ext":
+            data_dic = data_obj.get_extended_data()
+            self.params.data_to_use = "ext"
+        return data_dic
+
+    def load_data_object(self, experiment_phase):
+
+        data_obj = LoadData(session_name=self.session_name,
+                            experiment_phase=experiment_phase,
+                            pre_proc_dir=self.params.pre_proc_dir)
+        # write experiment phase id (_1, _2, ..) and experiment_phase data to params
+        self.session_params.experiment_phase_id = data_obj.get_experiment_phase_id()
+        self.session_params.experiment_phase = data_obj.get_experiment_phase()
+
+        return data_obj
+
+    """#################################################################################################################
+    #  analyzing single experiment phase for one population
+    #################################################################################################################"""
+
+    def sleep(self, experiment_phase, data_to_use="std"):
+
+        data_dic = self.load_data(experiment_phase=experiment_phase, data_to_use=data_to_use)
+
+        return TwoPopSleep(data_dic=data_dic, cell_type_1=self.cell_type_1, cell_type_2=self.cell_type_2,
+                           params=self.params, session_params=self.session_params, experiment_phase=experiment_phase)
 
 class MultipleSessions:
     """class for multiple sessions"""

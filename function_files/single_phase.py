@@ -42,7 +42,6 @@ from functools import partial
 import multiprocessing as mp
 import os, glob, re
 import pickle
-import pywt
 import importlib
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -133,8 +132,11 @@ class BaseMethods:
         else:
             data_dic = data_dic
 
-        # get all spike times
-        self.firing_times = data_dic["spike_times"][cell_type]
+        # get all spike times - check if spikes from several populations (e.g. p2 and p3)
+        if isinstance(cell_type, list) and len(cell_type)>1:
+            self.firing_times ={**data_dic["spike_times"][cell_type[0]], **data_dic["spike_times"][cell_type[1]]}
+        else:
+            self.firing_times = data_dic["spike_times"][cell_type]
 
         # get last recorded spike
         if "last_spike" in data_dic.keys():
@@ -152,7 +154,10 @@ class BaseMethods:
             self.eegh = data_dic["eegh"]
 
         # which cell type to be analyzed
-        self.cell_type = cell_type
+        if isinstance(cell_type, list):
+            self.cell_type = cell_type[0]+"_"+cell_type[1]
+        else:
+            self.cell_type = cell_type
 
         # initialize raster, loc and vel as None
         self.raster = None
@@ -1665,7 +1670,6 @@ class Sleep(BaseMethods):
         # import analysis parameters that are specific for the current session
         # --------------------------------------------------------------------------------------------------------------
         # rem/nrem phases with speeds above this threshold are discarded
-        self.params.sleep_phase_speed_threshold = self.session_params.sleep_phase_speed_threshold
         self.session_name = self.session_params.session_name
 
         # compression factor:
@@ -1676,37 +1680,8 @@ class Sleep(BaseMethods):
         # is used to scale awake activity to fit sleep activity
         # --------------------------------------------------------------------------------------------------------------
 
-        if cell_type == "p1_l":
-            self.session_params.sleep_compression_factor_12spikes_100ms = \
-                self.session_params.sleep_compression_factor_12spikes_100ms_p1_l
-        elif cell_type == "p1_r":
-            self.session_params.sleep_compression_factor_12spikes_100ms = \
-                self.session_params.sleep_compression_factor_12spikes_100ms_p1_r
-        else:
-            self.session_params.sleep_compression_factor_12spikes_100ms = \
-                self.session_params.sleep_compression_factor_12spikes_100ms
-
         # default models for behavioral data
         # --------------------------------------------------------------------------------------------------------------
-
-        if cell_type == "p1_l":
-            self.session_params.default_pre_phmm_model = self.session_params.default_pre_phmm_model_p1_l
-            self.session_params.default_post_phmm_model = self.session_params.default_post_phmm_model_p1_l
-            self.session_params.default_pre_ising_model = self.session_params.default_pre_ising_model_p1_l
-            self.session_params.default_post_ising_model = self.session_params.default_post_ising_model_p1_l
-        elif cell_type == "p1_r":
-            self.session_params.default_pre_phmm_model = self.session_params.default_pre_phmm_model_p1_r
-            self.session_params.default_post_phmm_model = self.session_params.default_post_phmm_model_p1_r
-            self.session_params.default_pre_ising_model = self.session_params.default_pre_ising_model_p1_r
-            self.session_params.default_post_ising_model = self.session_params.default_post_ising_model_p1_r
-        else:
-            self.session_params.default_pre_phmm_model = self.session_params.default_pre_phmm_model
-            self.session_params.default_post_phmm_model = self.session_params.default_post_phmm_model
-            self.session_params.default_pre_ising_model = self.session_params.default_pre_ising_model
-            self.session_params.default_post_ising_model = self.session_params.default_post_ising_model
-
-        # get sleep type (e.g. nREM, SW)
-        self.sleep_type = params.sleep_type
 
         # get data dictionary
         # check if list or dictionary is passed:
@@ -1736,7 +1711,7 @@ class Sleep(BaseMethods):
         # check first if data exists already
         if self.raster.shape[0] == 0:
             pre_prop_sleep = PreProcessSleep(firing_times=self.firing_times, params=self.params, time_stamps=None,
-                                             last_spike=self.last_spike, whl=self.whl)
+                                             last_spike=self.last_spike, whl=self.whl, spatial_factor=self.spatial_factor)
             raster = pre_prop_sleep.get_raster()
             speed = pre_prop_sleep.get_speed()
             loc = pre_prop_sleep.get_loc()
@@ -1840,12 +1815,11 @@ class Sleep(BaseMethods):
         return self.speed
 
     def get_correlation_matrices(self, bins_per_corr_matrix, cell_selection=None, only_upper_triangle=False):
-        if cell_selection is None:
-            file_name = self.params.session_name +"_"+self.params.experiment_phase+"_"+str(bins_per_corr_matrix)+"_bin_p_m_"+"excl_diag_"+\
-                        str(only_upper_triangle)+ "_all"
-        else:
-            file_name = self.params.session_name +"_"+self.params.experiment_phase+"_"+str(bins_per_corr_matrix)+"_bin_p_m_"+"excl_diag_"+\
-                        str(only_upper_triangle)+ "_stable"
+
+        file_name = self.session_name +"_"+self.experiment_phase+"_"+str(bins_per_corr_matrix)+"_"+self.cell_type+\
+                    "_bin_p_m_"+"excl_diag_"+\
+                    str(only_upper_triangle)+ "_all"
+
 
         # check first if correlation matrices have been computed and saved
         if not os.path.isfile(self.params.pre_proc_dir + "correlation_matrices/" + file_name+".npy"):
@@ -5193,7 +5167,7 @@ class Sleep(BaseMethods):
 
     # predicting time bin progression
     # ------------------------------------------------------------------------------------------------------------------
-    def predict_bin_progression(self, time_bin_size=None):
+    def predict_bin_progression(self, time_bin_size=None, norm_firing=False):
         """
         analysis of drift using population vectors
 
@@ -5209,8 +5183,9 @@ class Sleep(BaseMethods):
 
         x = self.raster
 
-        x = (x - np.min(x, axis=1, keepdims=True)) / \
-            (np.max(x, axis=1, keepdims=True) - np.min(x, axis=1, keepdims=True))
+        if norm_firing:
+            x = (x - np.min(x, axis=1, keepdims=True)) / \
+                (np.max(x, axis=1, keepdims=True) - np.min(x, axis=1, keepdims=True))
 
         # plot activation matrix (matrix of population vectors)
         plt.imshow(x, vmin=0, vmax=x.max(), cmap='jet', aspect='auto')
@@ -5226,7 +5201,7 @@ class Sleep(BaseMethods):
         y = np.arange(x.shape[1])
 
         new_ml = MlMethodsOnePopulation()
-        new_ml.ridge_time_bin_progress(x=x, y=y, new_time_bin_size=time_bin_size)
+        new_ml.ridge_time_bin_progress(x=x, y=y, new_time_bin_size=time_bin_size, plotting=True)
 
     def predict_time_bin_pop_vec_non_hse(self, normalize_firing_rates=True):
         # --------------------------------------------------------------------------------------------------------------
@@ -6756,20 +6731,18 @@ class Exploration(BaseMethods):
 
 
 """#####################################################################################################################
-#   CHEESEBOARD CLASS
+#   TRIAL PARENT CLASS
 #####################################################################################################################"""
 
 
-class Cheeseboard:
-    """Base class for cheese board task data analysis
-
-       ATTENTION: this is only used for the task data --> otherwise use Sleep class!
+class TrialParentClass:
+    """Base class for tasked data with trial structure (e.g. cheeseboard, cross maze, t-maze)
 
     """
 
     def __init__(self, data_dic, cell_type, params, session_params, experiment_phase=None):
         """
-        initializes cheeseboard class
+        initializes TrialBaseClass
 
         :param data_dic: dictionary containing spike data
         :type data_dic: python dic
@@ -6779,8 +6752,6 @@ class Cheeseboard:
         :type params: class
         :param session_params: sessions specific params
         :type session_params: class
-        :param exp_phase_id: which experiment phase id
-        :type exp_phase_id: int
         """
 
         # get standard analysis parameters
@@ -6807,8 +6778,15 @@ class Cheeseboard:
         if "eegh" in self.data_dic.keys():
             self.eegh = self.data_dic["eegh"]
 
-        # # get all spike times
-        self.firing_times = self.data_dic["spike_times"][cell_type]
+        # get all spike times --> check if two populations need to be combined
+        if isinstance(cell_type, list) and len(cell_type) > 1:
+            self.firing_times = {}
+            for ct in cell_type:
+                d = self.data_dic["spike_times"][ct]
+                for k, v in d.items():  # d.items() in Python 3+
+                    self.firing_times.setdefault(k, []).append(v)
+        else:
+            self.firing_times = self.data_dic["spike_times"][cell_type]
         # # get location data
         self.whl = self.data_dic["whl"]
 
@@ -6834,138 +6812,11 @@ class Cheeseboard:
         self.session_name = self.session_params.session_name
         self.nr_trials = len(self.data_dic["trial_data"])
 
-        # compression factor:
-        #
-        # compression factor used for sleep decoding --> e.g when we use constant #spike bins with 12 spikes
-        # we need to check how many spikes we have in e.g. 100ms windows if this was used for awake encoding
-        # if we have a mean of 30 spikes for awake --> compression factor = 12/30 --> 0.4
-        # is used to scale awake activity to fit sleep activity
-        # --------------------------------------------------------------------------------------------------------------
-
-        if cell_type == "p1_l":
-            self.session_params.sleep_compression_factor_12spikes_100ms = \
-                self.session_params.sleep_compression_factor_12spikes_100ms_p1_l
-        elif cell_type == "p1_r":
-            self.session_params.sleep_compression_factor_12spikes_100ms = \
-                self.session_params.sleep_compression_factor_12spikes_100ms_p1_r
-        else:
-            self.session_params.sleep_compression_factor_12spikes_100ms = \
-                self.session_params.sleep_compression_factor_12spikes_100ms
-
-        # default models for behavioral data
-        # --------------------------------------------------------------------------------------------------------------
-
-        if cell_type == "p1_l":
-            self.session_params.default_pre_phmm_model = self.session_params.default_pre_phmm_model_p1_l
-            self.session_params.default_post_phmm_model = self.session_params.default_post_phmm_model_p1_l
-            self.session_params.default_pre_ising_model = self.session_params.default_pre_ising_model_p1_l
-            self.session_params.default_post_ising_model = self.session_params.default_post_ising_model_p1_l
-        elif cell_type == "p1_r":
-            self.session_params.default_pre_phmm_model = self.session_params.default_pre_phmm_model_p1_r
-            self.session_params.default_post_phmm_model = self.session_params.default_post_phmm_model_p1_r
-            self.session_params.default_pre_ising_model = self.session_params.default_pre_ising_model_p1_r
-            self.session_params.default_post_ising_model = self.session_params.default_post_ising_model_p1_r
-        else:
-            self.session_params.default_pre_phmm_model = self.session_params.default_pre_phmm_model
-            self.session_params.default_post_phmm_model = self.session_params.default_post_phmm_model
-            self.session_params.default_pre_ising_model = self.session_params.default_pre_ising_model
-            self.session_params.default_post_ising_model = self.session_params.default_post_ising_model
-
-        # goal locations
-        # --------------------------------------------------------------------------------------------------------------
-        try:
-            self.goal_locations = self.session_params.goal_locations
-        except:
-            print("GOAL LOCATIONS NOT FOUND")
-
-        # convert goal locations from a.u. to cm
-        self.goal_locations = np.array(self.goal_locations) * self.spatial_factor
-
-        # get pre-selected trials (e.g. last 10 min of learning 1 and first 10 min of learning 2)
-        # --------------------------------------------------------------------------------------------------------------
-        if session_params.experiment_phase == "learning_cheeseboard_1":
-            self.default_trials = self.session_params.default_trials_lcb_1
-            self.default_ising = self.session_params.default_pre_ising_model
-            self.default_phmm = self.session_params.default_pre_phmm_model
-            self.default_phmm_stable = self.session_params.default_pre_phmm_model_stable
-        elif session_params.experiment_phase == "learning_cheeseboard_2":
-            self.default_trials = self.session_params.default_trials_lcb_2
-            self.default_ising = self.session_params.default_post_ising_model
-            self.default_phmm = self.session_params.default_post_phmm_model
-
-
-        # compute raster, location speed
-        # --------------------------------------------------------------------------------------------------------------
-        self.trial_loc_list = []
-        self.trial_raster_list = []
-        self.trial_speed_list = []
-
         # initialize environment dimensions --> are updated later while loading all trial data
         self.x_min = np.inf
         self.x_max = -np.inf
         self.y_min = np.inf
         self.y_max = -np.inf
-
-        # get x-max from start box --> discard all data that is smaller than x-max
-        x_max_sb = self.session_params.data_params_dictionary["start_box_coordinates"][1] * self.spatial_factor
-
-        # compute center of cheeseboard (x_max_sb + 110 cm, assumption: cheeseboard diameter: 220cm)
-        x_c = x_max_sb + 110 * self.spatial_factor
-
-        # use center of start box to find y coordinate of center of cheeseboard
-        y_c = self.session_params.data_params_dictionary["start_box_coordinates"][2]+ \
-              (self.session_params.data_params_dictionary["start_box_coordinates"][3] - \
-              self.session_params.data_params_dictionary["start_box_coordinates"][2])/2
-
-        cb_center = np.expand_dims(np.array([x_c, y_c]), 0)
-
-        # compute raster, location & speed for each trial
-        for trial_id, key in enumerate(self.data_dic["trial_data"]):
-            # compute raster, location and speed data
-            raster, loc, speed = PreProcessAwake(firing_times=self.data_dic["trial_data"][key]["spike_times"][cell_type],
-                                                 params=self.params, whl=self.data_dic["trial_data"][key]["whl"],
-                                                 spatial_factor=self.spatial_factor
-                                                 ).interval_temporal_binning_raster_loc_vel(
-                interval_start=self.data_dic["trial_timestamps"][0,trial_id],
-                interval_end=self.data_dic["trial_timestamps"][1,trial_id])
-
-            # TODO: improve filtering of spatial locations outside cheeseboard
-            if self.params.additional_spatial_filter:
-                # filter periods that are outside the cheeseboard
-                dist_from_center = distance.cdist(loc, cb_center, metric="euclidean")
-
-                raster = np.delete(raster, np.where(dist_from_center > 110* self.spatial_factor), axis=1)
-                speed = np.delete(speed, np.where(dist_from_center > 110* self.spatial_factor))
-                loc = np.delete(loc, np.where(dist_from_center > 110* self.spatial_factor), axis=0)
-
-            # TODO delete this section below
-            # if self.session_name == "mjc163R4R_0114":
-            #     dist_from_center = distance.cdist(loc, cb_center, metric="euclidean")
-            #
-            #     raster = np.delete(raster, np.where(dist_from_center > 110* self.spatial_factor), axis=1)
-            #     speed = np.delete(speed, np.where(dist_from_center > 110* self.spatial_factor))
-            #     loc = np.delete(loc, np.where(dist_from_center > 110* self.spatial_factor), axis=0)
-
-            # if self.session_name == "mjc148R4R_0113":
-            #     raster = np.delete(raster, np.where(loc[:,0] < 85* self.spatial_factor), axis=1)
-            #     speed = np.delete(speed, np.where(loc[:, 0] < 85* self.spatial_factor))
-            #     loc = np.delete(loc, np.where(loc[:, 0] < 85), axis=0)
-
-            if self.session_name in ["mjc163R2R_0114", "mjc163R4R_0114", "mjc169R4R_0114", "mjc163R1L_0114",
-                                     "mjc163R3L_0114", "mjc169R1R_0114"]:
-                raster = np.delete(raster, np.where(loc[:,0] < x_max_sb), axis=1)
-                speed = np.delete(speed, np.where(loc[:, 0] < x_max_sb))
-                loc = np.delete(loc, np.where(loc[:, 0] < x_max_sb), axis=0)
-
-            # update environment dimensions
-            self.x_min = min(self.x_min, min(loc[:,0]))
-            self.x_max = max(self.x_max, max(loc[:, 0]))
-            self.y_min = min(self.y_min, min(loc[:,1]))
-            self.y_max = max(self.y_max, max(loc[:, 1]))
-
-            self.trial_raster_list.append(raster)
-            self.trial_loc_list.append(loc)
-            self.trial_speed_list.append(speed)
 
     """#################################################################################################################
     #  Data processing
@@ -7136,7 +6987,6 @@ class Cheeseboard:
         stillness_rasters = np.hstack(stillness_rasters)
 
         return stillness_rasters
-
 
     def get_speed(self):
         """
@@ -7440,103 +7290,11 @@ class Cheeseboard:
             raster = np.hstack((raster, self.trial_raster_list[trial_id]))
             loc = np.vstack((loc, self.trial_loc_list[trial_id]))
         ax.scatter(loc[:, 0], loc[:, 1], color="grey", s=1, label="TRACKING")
-        plt.ylim(0, 300)
-        plt.xlim(0, 350)
         plt.show()
-
-    def plot_tracking_and_goals(self, ax=None, trials_to_use=None):
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-        if ax is None:
-            fig = plt.figure()
-            ax = fig.add_subplot(111)
-
-        # get location data from trials
-        nr_cells = self.trial_raster_list[0].shape[0]
-        loc = np.empty((0,2))
-        raster = np.empty((nr_cells, 0))
-        for trial_id in trials_to_use:
-            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
-            loc = np.vstack((loc, self.trial_loc_list[trial_id]))
-        ax.scatter(loc[:, 0], loc[:, 1], color="grey", s=1, label="TRACKING")
-
-        # plot actual trajectory
-        for part in range(loc.shape[0]-1):
-            ax.plot(loc[part:part+2, 0], loc[part:part+2, 1], color="red")
-
-        for g_l in self.goal_locations:
-            ax.scatter(g_l[0], g_l[1], marker="x", color="w", label="GOALS")
-        plt.show()
-
-    def plot_tracking_and_goals_first_or_last_trial(self, ax=None, save_fig=False, trial="first"):
-
-        if save_fig:
-            plt.style.use('default')
-        if trial=="first":
-            trials_to_use = [0]
-        elif trial =="last":
-            trials_to_use = [len(self.trial_raster_list) - 1]
-        else:
-            raise Exception("Define [first] or [last] trial")
-
-        if ax is None:
-            fig = plt.figure()
-            ax = fig.add_subplot(111)
-
-        # get location data from trials
-        nr_cells = self.trial_raster_list[0].shape[0]
-        loc = np.empty((0,2))
-        raster = np.empty((nr_cells, 0))
-        for trial_id in trials_to_use:
-            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
-            loc = np.vstack((loc, self.trial_loc_list[trial_id]))
-        # ax.scatter(loc[:, 0], loc[:, 1], color="lightblue", s=1, label="TRACKING")
-
-        # plot actual trajectory
-        for part in range(loc.shape[0]-1):
-            ax.plot(loc[part:part+2, 0], loc[part:part+2, 1], color="lightblue", label="Tracking")
-
-        for g_l in self.goal_locations:
-            ax.scatter(g_l[0], g_l[1], color="black", label="Goals")
-
-        plt.gca().set_aspect('equal', adjustable='box')
-        handles, labels = plt.gca().get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        plt.legend(by_label.values(), by_label.keys())
-        plt.xlim(20, 160)
-        plt.ylim(10, 130)
-        plt.xlabel("X (cm)")
-        plt.ylabel("Y (cm)")
-
-        if save_fig:
-            plt.rcParams['svg.fonttype'] = 'none'
-            plt.savefig(self.experiment_phase+"_tracking_"+trial+"_trial.svg", transparent="True")
-            plt.close()
-        else:
-            plt.show()
 
     """#################################################################################################################
     #  Saving methods
     #################################################################################################################"""
-
-    def save_goal_coding_all_modes(self, nr_modes, out_file_name):
-
-        trials_to_use = self.default_trials
-
-        file_name = self.session_name + "_" + str(
-            int(self.params.experiment_phase_id[0])) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
-                      "_"+str(trials_to_use[-1])+"_"+str(nr_modes)+"_modes"
-
-        frac_per_mode = []
-        for mode_id in range(nr_modes):
-            frac_close_to_goal = self.analyze_modes_goal_coding(file_name=file_name, mode_ids=mode_id)
-            frac_per_mode.append(frac_close_to_goal)
-
-        np.save(out_file_name, np.array(frac_per_mode))
-        plt.hist(frac_per_mode, bins=20)
-        plt.xlabel("FRACTION AROUND GOAL")
-        plt.ylabel("COUNT")
-        plt.show()
 
     def save_raster(self, filename, trials_to_use=None):
         raster, _, _ = self.get_raster_location_speed(trials_to_use=trials_to_use)
@@ -8542,6 +8300,2106 @@ class Cheeseboard:
 
         else:
             return swr_raster[stable_cells, :], swr_raster[dec_cells, :], swr_raster[inc_cells, :]
+
+    """#################################################################################################################
+    #  poisson hmm
+    #################################################################################################################"""
+
+    def cross_val_poisson_hmm(self, trials_to_use=None, cl_ar=np.arange(1, 50, 5), cells_to_use="all_cells"):
+        # --------------------------------------------------------------------------------------------------------------
+        # cross validation of poisson hmm fits to data
+        #
+        # args:     - cl_ar, range object: #clusters to fit to data
+        # --------------------------------------------------------------------------------------------------------------
+
+        print(" - CROSS-VALIDATING POISSON HMM ON CHEESEBOARD --> OPTIMAL #MODES ...")
+        print("  - nr modes to compute: "+str(cl_ar))
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        print("   --> USING TRIALS: "+str(trials_to_use[0])+"-"+str(trials_to_use[-1])+"\n")
+
+        # check how many cells
+        nr_cells = self.trial_raster_list[0].shape[0]
+        raster = np.empty((nr_cells, 0))
+
+        trial_lengths = []
+        for trial_id in trials_to_use:
+            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
+            trial_lengths.append(self.trial_raster_list[trial_id].shape[1])
+
+        # if subset of cells to use
+        if cells_to_use == "stable_cells":
+            # load cell labels
+            with open(self.params.pre_proc_dir + "cell_classification/" +
+                      self.session_name + "_" + self.params.stable_cell_method + ".pickle", "rb") as f:
+                class_dic = pickle.load(f)
+
+            stable_cells = class_dic["stable_cell_ids"].flatten()
+            raster = raster[stable_cells, :]
+
+        elif cells_to_use == "decreasing_cells":
+                        # load cell labels
+            with open(self.params.pre_proc_dir + "cell_classification/" +
+                      self.session_name + "_" + self.params.stable_cell_method + ".pickle", "rb") as f:
+                class_dic = pickle.load(f)
+
+            dec_cells = class_dic["decrease_cell_ids"].flatten()
+            raster = raster[dec_cells, :]
+
+        if self.params.cross_val_splits == "trial_splitting":
+            trial_end = np.cumsum(np.array(trial_lengths))
+            trial_start = np.concatenate([[0], trial_end[:-1]])
+            # test_range = np.vstack((trial_start, trial_end))
+            test_range_per_fold = []
+            for lo, hi in zip(trial_start, trial_end):
+                test_range_per_fold.append(np.array(list(range(lo, hi))))
+
+        elif self.params.cross_val_splits == "custom_splits":
+
+            # number of folds
+            nr_folds = 10
+            # how many times to fit for each split
+            max_nr_fitting = 5
+            # how many chunks (for pre-computed splits)
+            nr_chunks = 10
+
+            unobserved_lo_array = pickle.load(
+                open("temp_data/unobserved_lo_cv" + str(nr_folds) + "_" + str(nr_chunks) + "_chunks", "rb"))
+            unobserved_hi_array = pickle.load(
+                open("temp_data/unobserved_hi_cv" + str(nr_folds) + "_" + str(nr_chunks) + "_chunks", "rb"))
+
+            # set number of time bins
+            bin_num = raster.shape[1]
+            bins = np.arange(bin_num + 1)
+
+            # length of one chunk
+            n_chunks = int(bin_num / nr_chunks)
+            test_range_per_fold = []
+            for fold in range(nr_folds):
+
+                # unobserved_lo: start bins (in spike data resolution) for all test data chunks
+                unobserved_lo = []
+                unobserved_hi = []
+                for lo, hi in zip(unobserved_lo_array[fold], unobserved_hi_array[fold]):
+                    unobserved_lo.append(bins[lo * n_chunks])
+                    unobserved_hi.append(bins[hi * n_chunks])
+
+                unobserved_lo = np.array(unobserved_lo)
+                unobserved_hi = np.array(unobserved_hi)
+
+                test_range = []
+                for lo, hi in zip(unobserved_lo, unobserved_hi):
+                    test_range += (list(range(lo, hi)))
+                test_range_per_fold.append(np.array(test_range))
+
+        nr_cores = 12
+
+        folder_name = self.session_name +"_"+self.experiment_phase_id+"_"+self.cell_type+\
+                      "_trials_"+str(trials_to_use[0])+"_"+str(trials_to_use[-1])
+
+        new_ml = MlMethodsOnePopulation(params=self.params)
+        new_ml.parallelize_cross_val_model(nr_cluster_array=cl_ar, nr_cores=nr_cores, model_type="pHMM",
+                                           raster_data=raster, folder_name=folder_name, splits=test_range_per_fold,
+                                           cells_used=cells_to_use)
+        # new_ml.cross_val_view_results(folder_name=folder_name)
+
+    def plot_custom_splits(self):
+        new_ml = MlMethodsOnePopulation(params=self.params)
+        new_ml.plot_custom_splits()
+
+    def find_and_fit_optimal_number_of_modes(self, cells_to_use="all_cells", cl_ar_init = np.arange(1, 50, 5)):
+        # compute likelihoods with standard spacing first
+        self.cross_val_poisson_hmm(cells_to_use=cells_to_use, cl_ar=cl_ar_init)
+        # get optimal number of modes for coarse grained
+        trials_to_use = self.default_trials
+        folder_name = self.session_name + "_" + str(
+            int(self.experiment_phase_id)) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
+                      "_"+str(trials_to_use[-1])
+        new_ml = MlMethodsOnePopulation(params=self.params)
+        opt_nr_coarse = new_ml.get_optimal_mode_number(folder_name=folder_name, cells_used=cells_to_use)
+        print("Coarse opt. number of modes: "+str(opt_nr_coarse))
+        self.cross_val_poisson_hmm(cells_to_use=cells_to_use, cl_ar=np.arange(opt_nr_coarse - 2, opt_nr_coarse + 3, 2))
+        opt_nr_fine = new_ml.get_optimal_mode_number(folder_name=folder_name, cells_used=cells_to_use)
+        print("Fine opt. number of modes: " + str(opt_nr_fine))
+        self.fit_poisson_hmm(nr_modes=opt_nr_fine, cells_to_use=cells_to_use)
+
+    def view_cross_val_results(self, trials_to_use=None, range_to_plot=None, save_fig=False, cells_used="all_cells"):
+        # --------------------------------------------------------------------------------------------------------------
+        # views cross validation results
+        #
+        # args:     - model_type, string: which type of model ("POISSON_HMM")
+        #           - custom_splits, bool: whether custom splits were used for cross validation
+        # --------------------------------------------------------------------------------------------------------------
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        folder_name = self.session_name + "_" + str(
+            int(self.experiment_phase_id[0])) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
+                      "_"+str(trials_to_use[-1])
+        new_ml = MlMethodsOnePopulation(params=self.params)
+        new_ml.cross_val_view_results(folder_name=folder_name, range_to_plot=range_to_plot, save_fig=save_fig,
+                                      cells_used=cells_used)
+
+    def fit_poisson_hmm(self, nr_modes, trials_to_use=None, cells_to_use="all_cells"):
+        # --------------------------------------------------------------------------------------------------------------
+        # fits poisson hmm to data
+        #
+        # args:     - nr_modes, int: #clusters to fit to data
+        #           - file_identifier, string: string that is added at the end of file for identification
+        # --------------------------------------------------------------------------------------------------------------
+
+        print(" - FITTING POISSON HMM WITH "+str(nr_modes)+" MODES ...\n")
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        # check how many cells
+        nr_cells = self.trial_raster_list[0].shape[0]
+        raster = np.empty((nr_cells, 0))
+
+        for trial_id in trials_to_use:
+            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
+
+        # if subset of cells to use
+        if cells_to_use == "stable_cells":
+            # load cell labels
+            with open(self.params.pre_proc_dir + "cell_classification/" +
+                      self.session_name + "_" + self.params.stable_cell_method + ".pickle", "rb") as f:
+                class_dic = pickle.load(f)
+
+            stable_cells = class_dic["stable_cell_ids"].flatten()
+            raster = raster[stable_cells, :]
+
+        elif cells_to_use == "decreasing_cells":
+                        # load cell labels
+            with open(self.params.pre_proc_dir + "cell_classification/" +
+                      self.session_name + "_" + self.params.stable_cell_method + ".pickle", "rb") as f:
+                class_dic = pickle.load(f)
+
+            dec_cells = class_dic["decrease_cell_ids"].flatten()
+            raster = raster[dec_cells, :]
+
+        log_li = -1*np.inf
+        # fit 10 times to select model with best highest log-likelihood (NOT CROSS-VALIDATED!!!)
+        for i in range(10):
+            test_model = PoissonHMM(n_components=nr_modes)
+            test_model.fit(raster.T)
+            log_li_test = test_model.score(raster.T)
+            if log_li_test > log_li:
+                model = test_model
+                log_li = log_li_test
+
+        model.set_time_bin_size(time_bin_size=self.params.time_bin_size)
+
+        if cells_to_use == "stable_cells":
+            save_dir = self.params.pre_proc_dir+"phmm/stable_cells/"
+        elif cells_to_use == "decreasing_cells":
+            save_dir = self.params.pre_proc_dir+"phmm/decreasing_cells/"
+        elif cells_to_use == "all_cells":
+            save_dir = self.params.pre_proc_dir+"phmm/"
+        file_name = self.session_name + "_" + str(
+            int(self.experiment_phase_id)) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
+                      "_"+str(trials_to_use[-1])+"_"+str(nr_modes)+"_modes"
+
+        with open(save_dir+file_name+".pkl", "wb") as file: pickle.dump(model, file)
+
+        print("  - ... DONE!\n")
+
+    def evaluate_poisson_hmm(self, nr_modes, trials_to_use=None, save_fig=False):
+        # --------------------------------------------------------------------------------------------------------------
+        # fits poisson hmm to data and evaluates the goodness of the model by comparing basic statistics (avg. firing
+        # rate, correlation values, k-statistics) between real data and data sampled from the model
+        #
+        # args:     - nr_modes, int: #clusters to fit to data
+        #           - load_from_file, bool: whether to load model from file or to fit model again
+        # --------------------------------------------------------------------------------------------------------------
+
+        print(" - EVALUATING POISSON HMM FIT (BASIC STATISTICS) ...")
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        # check how many cells
+        nr_cells = self.trial_raster_list[0].shape[0]
+        raster = np.empty((nr_cells, 0))
+        for trial_id in trials_to_use:
+            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
+        nr_time_bins = raster.shape[1]
+        # X = X[:, :1000]
+
+        file_name = self.session_name + "_" + str(
+            int(self.experiment_phase_id[0])) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
+                      "_"+str(trials_to_use[-1])+"_"+str(nr_modes)+"_modes"
+
+        # check if model file exists already --> otherwise fit model again
+        if os.path.isfile(self.params.pre_proc_dir+"phmm/" + file_name + ".pkl"):
+            print("- LOADING PHMM MODEL FROM FILE\n")
+            with open(self.params.pre_proc_dir+"phmm/" + file_name + ".pkl", "rb") as file:
+                model = pickle.load(file)
+        else:
+            print("- PHMM MODEL FILE NOT FOUND --> FITTING PHMM TO DATA\n")
+            model = PoissonHMM(n_components=nr_modes)
+            model.fit(raster.T)
+
+        samples, sequence = model.sample(nr_time_bins*50)
+        samples = samples.T
+
+        if save_fig:
+            mean_dic, corr_dic, k_dic = evaluate_clustering_fit(real_data=raster, samples=samples, binning="TEMPORAL_SPIKE",
+                                   time_bin_size=0.1, plotting=False)
+
+            plt.style.use('default')
+            k_samples_sorted = np.sort(k_dic["samples"])
+            k_data_sorted = np.sort(k_dic["real"])
+
+            p_samples = 1. * np.arange(k_samples_sorted.shape[0]) / (k_samples_sorted.shape[0] - 1)
+            p_data = 1. * np.arange(k_data_sorted.shape[0]) / (k_data_sorted.shape[0] - 1)
+            # plt.hlines(0.5, -0.02, 0.85, color="gray", linewidth=0.5)
+            plt.plot(k_data_sorted, p_data, color="darkorange", label="Data")
+            plt.plot(k_samples_sorted, p_samples, color="bisque", label="Model")
+            plt.ylabel("CDF")
+            plt.xlabel("% active cells per time bin")
+            plt.legend()
+            plt.title("Model quality: k-statistic")
+            make_square_axes(plt.gca())
+
+            plt.rcParams['svg.fonttype'] = 'none'
+            plt.savefig("model_qual_k.svg", transparent="True")
+            plt.close()
+
+            # plot single figures
+            plt.plot([-0.2, max(np.maximum(corr_dic["samples"].flatten(), corr_dic["real"].flatten()))],
+                     [-0.2,max(np.maximum(corr_dic["samples"].flatten(),corr_dic["real"].flatten()))],
+                     linestyle="dashed", c="gray")
+            plt.scatter(corr_dic["samples"].flatten(), corr_dic["real"].flatten(), color="pink")
+            plt.xlabel("Correlations (samples)")
+            plt.ylabel("Correlations (data)")
+            plt.title("Model quality: correlations ")
+            plt.text(0.0, 0.9, "R = " + str(round(corr_dic["corr"][0], 4)))
+            make_square_axes(plt.gca())
+            plt.rcParams['svg.fonttype'] = 'none'
+            plt.savefig("model_qual_correlations.svg", transparent="True")
+            plt.close()
+
+            # plot single figures
+            plt.plot([0, max(np.maximum(mean_dic["samples"].flatten(), mean_dic["real"].flatten()))],
+                     [0,max(np.maximum(mean_dic["samples"].flatten(),mean_dic["real"].flatten()))],
+                     linestyle="dashed", c="gray")
+            plt.scatter(mean_dic["samples"].flatten(), mean_dic["real"].flatten(), color="turquoise")
+            plt.xlabel("Mean firing rate (samples)")
+            plt.ylabel("Mean firing rate (data)")
+            plt.title("Model quality: mean firing ")
+            plt.text(1.2, 12, "R = " + str(round(mean_dic["corr"][0], 4)))
+            make_square_axes(plt.gca())
+            # plt.show()
+            plt.rcParams['svg.fonttype'] = 'none'
+            plt.savefig("model_qual_mean_firing.svg", transparent="True")
+            plt.close()
+        else:
+
+            evaluate_clustering_fit(real_data=raster, samples=samples, binning="TEMPORAL_SPIKE",
+                                    time_bin_size=0.1, plotting=True)
+
+    def evaluate_multiple_poisson_hmm_models(self, nr_modes_range, trials_to_use=None):
+        # --------------------------------------------------------------------------------------------------------------
+        # fits poisson hmm to data and evaluates the goodness of the model by comparing basic statistics (avg. firing
+        # rate, correlation values, k-statistics) between real data and data sampled from the model
+        #
+        # args:     - nr_modes, int: #clusters to fit to data
+        #           - load_from_file, bool: whether to load model from file or to fit model again
+        # --------------------------------------------------------------------------------------------------------------
+
+        print("- EVALUATING POISSON HMM FIT (BASIC STATISTICS) ...")
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        # check how many cells
+        nr_cells = self.trial_raster_list[0].shape[0]
+        raster = np.empty((nr_cells, 0))
+        for trial_id in trials_to_use:
+            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
+        nr_time_bins = raster.shape[1]
+        # X = X[:, :1000]
+
+        mean_res = []
+        corr_res = []
+        k_res = []
+
+        for nr_modes in nr_modes_range:
+            fit_mean_res = []
+            fit_corr_res = []
+            fit_k_res = []
+            for nr_fit in range(10):
+                print(" - FITTING PHMM MODEL WITH "+str(nr_modes)+" MODES - FIT NR: "+str(nr_fit))
+                model = PoissonHMM(n_components=nr_modes)
+                model.fit(raster.T)
+
+                samples, sequence = model.sample(nr_time_bins*50)
+                samples = samples.T
+                mean_dic, corr_dic, k_dic = evaluate_clustering_fit(real_data=raster, samples=samples,
+                                                                    binning="TEMPORAL_SPIKE",
+                                                                    time_bin_size=0.1, plotting=False)
+                fit_mean_res.append(mean_dic["corr"][0])
+                fit_corr_res.append(corr_dic["corr_triangles"][0])
+                fit_k_res.append(k_dic["diff_med"])
+
+
+            mean_res.append([np.mean(np.array(fit_mean_res)), np.std(np.array(fit_mean_res))])
+            corr_res.append([np.mean(np.array(fit_corr_res)), np.std(np.array(fit_corr_res))])
+            k_res.append([np.mean(np.array(fit_k_res)), np.std(np.array(fit_k_res))])
+
+        mean_res = np.array(mean_res)
+        corr_res = np.array(corr_res)
+        k_res = np.array(k_res)
+
+        # plot results
+        plt.figure(figsize=(5,10))
+        plt.subplot(3,1,1)
+        plt.errorbar(nr_modes_range, mean_res[:,0],yerr=mean_res[:,1], color="r")
+        plt.grid(color="gray")
+        plt.ylabel("PEARSON R: MEAN FIRING")
+        plt.ylim(min(mean_res[:,0])-max(mean_res[:,1]), max(mean_res[:,0])+max(mean_res[:,1]))
+        plt.subplot(3,1,2)
+        plt.errorbar(nr_modes_range, corr_res[:,0],yerr=corr_res[:,1], color="r")
+        plt.ylabel("PEARSON R: CORR")
+        plt.grid(color="gray")
+        plt.ylim(min(corr_res[:,0])-max(corr_res[:,1]), max(corr_res[:,0])+max(corr_res[:,1]))
+        plt.subplot(3,1,3)
+        plt.errorbar(nr_modes_range, k_res[:,0],yerr=k_res[:,1], color="r")
+        plt.ylabel("DIFF. MEDIANS")
+        plt.xlabel("NR. MODES")
+        plt.grid(color="gray")
+        plt.ylim(min(k_res[:,0])-max(k_res[:,1]), max(k_res[:,0])+max(k_res[:,1]))
+        plt.show()
+
+    def decode_poisson_hmm(self, trials_to_use=None, file_name=None, cells_to_use="all"):
+        # --------------------------------------------------------------------------------------------------------------
+        # loads model from file and decodes data
+        #
+        # args:     - nr_modes, int: #clusters to fit to data --> used to identify file that fits the data
+        #           - file_name, string:    is used if model from a different experiment phase is supposed to be used
+        #                                   (e.g. model from awake is supposed to be fit to sleep data)
+        # --------------------------------------------------------------------------------------------------------------
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+        if trials_to_use is "all":
+            trials_to_use = range(self.nr_trials)
+
+
+        # check how many cells
+        nr_cells = self.trial_raster_list[0].shape[0]
+        raster = np.empty((nr_cells, 0))
+        for trial_id in trials_to_use:
+            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
+        nr_time_bins = raster.shape[1]
+
+        if file_name is None:
+            file_name = self.default_phmm
+        if cells_to_use == "all":
+            with open(self.params.pre_proc_dir+"phmm/"+file_name+".pkl", "rb") as file:
+                model = pickle.load(file)
+        elif cells_to_use == "stable":
+            with open(self.params.pre_proc_dir+"phmm/stable_cells/"+file_name+".pkl", "rb") as file:
+                model = pickle.load(file)
+            with open(self.params.pre_proc_dir + "cell_classification/" +
+                      self.session_name + "_" + self.params.stable_cell_method + ".pickle",
+                      "rb") as f:
+                class_dic = pickle.load(f)
+            raster = raster[class_dic["stable_cell_ids"], :]
+
+        elif cells_to_use == "decreasing":
+            with open(self.params.pre_proc_dir+"phmm/decreasing_cells/"+file_name+".pkl", "rb") as file:
+                model = pickle.load(file)
+            with open(self.params.pre_proc_dir + "cell_classification/" +
+                      self.session_name + "_" + self.params.stable_cell_method + ".pickle",
+                      "rb") as f:
+                class_dic = pickle.load(f)
+            raster = raster[class_dic["decrease_cell_ids"], :]
+
+        nr_modes_ = model.means_.shape[0]
+
+        # compute most likely sequence
+        sequence = model.predict(raster.T)
+        post_prob = model.predict_proba(raster.T)
+        return sequence, nr_modes_, post_prob
+
+    def load_poisson_hmm(self, trials_to_use=None, nr_modes=None, file_name=None, cells_to_use="all_cells"):
+        # --------------------------------------------------------------------------------------------------------------
+        # loads model from file and returns model
+        #
+        # args:     - nr_modes, int: #clusters to fit to data --> used to identify file that fits the data
+        #           - file_name, string:    is used if model from a different experiment phase is supposed to be used
+        #                                   (e.g. model from awake is supposed to be fit to sleep data)
+        # --------------------------------------------------------------------------------------------------------------
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        if (nr_modes is None) & (file_name is None):
+            raise Exception("PROVIDE NR. MODES OR FILE NAME")
+
+        if file_name is None:
+            file_name = self.params.session_name + "_" + str(
+                int(self.params.experiment_phase_id[0])) + "_" + self.cell_type + "_trials_" + str(trials_to_use[0]) + \
+                        "_" + str(trials_to_use[-1]) + "_" + str(nr_modes) + "_modes"
+        else:
+            file_name =file_name
+
+        if cells_to_use == "stable_cells":
+            save_dir = self.params.pre_proc_dir+"phmm/stable_cells"
+        elif cells_to_use == "decreasing_cells":
+            save_dir = self.params.pre_proc_dir+"phmm/decreasing_cells"
+        elif cells_to_use == "all_cells":
+            save_dir = self.params.pre_proc_dir+"phmm/"
+
+        with open(save_dir+file_name+".pkl", "rb") as file:
+            model = pickle.load(file)
+
+        return model
+
+    def fit_spatial_gaussians_for_modes(self, nr_modes=None, file_name=None, trials_to_use=None,
+                                        min_nr_bins_active=5, plot_awake_fit=False, plot_modes=False):
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        # get location data from trials
+        nr_cells = self.trial_raster_list[0].shape[0]
+        loc = np.empty((0,2))
+        raster = np.empty((nr_cells, 0))
+        for trial_id in trials_to_use:
+            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
+            loc = np.vstack((loc, self.trial_loc_list[trial_id]))
+
+        state_sequence, nr_modes, _ = self.decode_poisson_hmm(file_name=file_name,
+                                                           trials_to_use=trials_to_use)
+
+        mode_id, freq = np.unique(state_sequence, return_counts=True)
+        modes_to_plot = mode_id[freq > min_nr_bins_active]
+
+        cmap = generate_colormap(nr_modes)
+        if plot_modes:
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+            for mode in np.arange(nr_modes):
+                mode_data = loc[state_sequence == mode, :]
+                # rgb = (random.random(), random.random(), random.random())
+                ax.scatter(mode_data[:, 0], mode_data[:, 1],
+                           alpha=1, marker=".", s=1, label="DIFFERENT MODES", c=np.array([cmap(mode)]))
+
+            ax.set_ylim(self.y_min, self.y_max)
+            ax.set_xlim(self.x_min, self.x_max)
+            for g_l in self.goal_locations:
+                ax.scatter(g_l[0], g_l[1], color="w", label="GOALS")
+
+            plt.gca().set_aspect('equal', adjustable='box')
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = OrderedDict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys())
+            plt.title("MODE ASSIGNMENT AWAKE DATA")
+            plt.xlabel("X")
+            plt.ylabel("Y")
+            plt.show()
+
+            for mode in np.arange(nr_modes):
+                mode_data = loc[state_sequence == mode, :]
+                fig, ax = plt.subplots()
+                ax.scatter(loc[:,0], loc[:,1], color="grey", s=1, label="TRACKING")
+                ax.scatter(mode_data[:, 0], mode_data[:, 1],
+                       alpha=1, marker=".", s=1, label="MODE " + str(mode) + " ASSIGNED",
+                           color="red")
+                for g_l in self.goal_locations:
+                    ax.scatter(g_l[0], g_l[1], color="w", label="GOALS")
+                ax.set_ylim(self.y_min, self.y_max)
+                ax.set_xlim(self.x_min, self.x_max)
+                plt.xlabel("X")
+                plt.ylabel("Y")
+                plt.gca().set_aspect('equal', adjustable='box')
+                handles, labels = ax.get_legend_handles_labels()
+                by_label = OrderedDict(zip(labels, handles))
+                ax.legend(by_label.values(), by_label.keys())
+                plt.show()
+
+        means = np.zeros((2, nr_modes))
+        cov = np.zeros((2, nr_modes))
+        for mode in np.arange(nr_modes):
+            mode_data = loc[state_sequence == mode, :]
+
+            if len(mode_data) == 0:
+                means[:, mode] = np.nan
+                cov[:, mode] = np.nan
+            else:
+                means[:, mode] = np.mean(mode_data, axis=0)
+                cov[:, mode] = np.var(mode_data, axis=0)
+
+        loc_data = loc[:, :]
+
+        center = np.min(loc_data, axis=0) + (np.max(loc_data, axis=0) - np.min(loc_data, axis=0)) * 0.5
+        dist = loc_data - center
+
+        rad = max(np.sqrt(np.square(dist[:, 0]) + np.square(dist[:, 1]))) + 1
+
+        std_modes = np.sqrt(cov[0,:]+cov[1,:])
+        std_modes[std_modes == 0] = np.nan
+
+        if plot_awake_fit:
+
+            for mode_to_plot in modes_to_plot:
+
+                mean = means[:, mode_to_plot]
+                cov_ = cov[:, mode_to_plot]
+                std_ = std_modes[mode_to_plot]
+
+                # Parameters to set
+                mu_x = mean[0]
+                variance_x = cov_[0]
+
+                mu_y = mean[1]
+                variance_y = cov_[1]
+
+                # Create grid and multivariate normal
+                x = np.linspace(center[0] - rad, center[0]+rad, int(2.2*rad))
+                y = np.linspace(0, 250, 250)
+                X, Y = np.meshgrid(x, y)
+                pos = np.empty(X.shape + (2,))
+                pos[:, :, 0] = X
+                pos[:, :, 1] = Y
+                rv = multivariate_normal([mu_x, mu_y], [[variance_x, 0], [0, variance_y]])
+                rv_normalized = rv.pdf(pos) / np.sum(rv.pdf(pos).flatten())
+
+                fig, ax = plt.subplots()
+                gauss = ax.imshow(rv_normalized)
+                env = Circle((center[0], center[1]), rad, color="white", fill=False)
+                ax.add_artist(env)
+                ax.set_ylim(center[1] - 1.1*rad, center[1]+1.1*rad)
+                ax.scatter(loc_data[state_sequence == mode_to_plot, 0], loc_data[state_sequence == mode_to_plot, 1],
+                           alpha=1, c="white", marker=".", s=0.3, label="MODE "+ str(mode_to_plot) +" ASSIGNED")
+                cb = plt.colorbar(gauss)
+                cb.set_label("PROBABILITY")
+                plt.xlabel("X")
+                plt.ylabel("Y")
+                plt.title("STD: "+str(np.round(std_, 2)))
+                plt.legend()
+                plt.show()
+
+        # compute frequency of each mode
+        mode_freq = np.zeros(nr_modes)
+        mode_freq[mode_id] = freq
+        mode_freq = mode_freq.astype(int)
+
+        env = Circle((center[0], center[1]), rad, color="white", fill=False)
+
+        result_dic = {
+            "std_modes": std_modes
+        }
+
+        with open("temp_data/test1", "wb") as f:
+            pickle.dump(result_dic, f)
+
+
+        return means, std_modes, mode_freq, env, state_sequence
+
+    def plot_all_phmm_modes_spatial(self, nr_modes):
+        for i in range(nr_modes):
+            self.plot_phmm_mode_spatial(mode_id = i)
+
+    def plot_phmm_mode_spatial(self, mode_id, ax=None, save_fig=False, use_viterbi=True, cells_to_use="all"):
+        plt.style.use('default')
+        if ax is None:
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+
+        trials_to_use = self.default_trials
+
+        # get location data from trials
+        nr_cells = self.trial_raster_list[0].shape[0]
+        loc = np.empty((0,2))
+        raster = np.empty((nr_cells, 0))
+        for trial_id in trials_to_use:
+            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
+            loc = np.vstack((loc, self.trial_loc_list[trial_id]))
+
+        # plot all tracking data
+        ax.scatter(loc[:,0], loc[:,1], color="lightgray", s=1, label="Tracking")
+
+        if use_viterbi:
+            if cells_to_use == "all":
+                file_name = self.default_phmm
+            elif cells_to_use == "stable":
+                file_name = self.default_phmm_stable
+            state_sequence, nr_modes, _ = self.decode_poisson_hmm(file_name=file_name,
+                                                               trials_to_use=trials_to_use, cells_to_use=cells_to_use)
+        else:
+            cells_to_use = "stable"
+            # load phmm model
+            with open(self.params.pre_proc_dir + "phmm/" + self.default_phmm + '.pkl', 'rb') as f:
+                model_dic = pickle.load(f)
+            # get means of model (lambdas) for decoding
+            mode_means = model_dic.means_
+            cell_selection = "custom"
+            with open(self.params.pre_proc_dir + "cell_classification/" +
+                      self.session_name + "_" + self.params.stable_cell_method + ".pickle", "rb") as f:
+                class_dic = pickle.load(f)
+
+            if cells_to_use == "stable":
+                cell_ids = class_dic["stable_cell_ids"]
+            results_list = decode_using_phmm_modes(mode_means=mode_means, event_spike_rasters=[raster],
+                                                   compression_factor=1, cells_to_use=cell_ids,
+                                                   cell_selection=cell_selection)
+            likelihoods = results_list[0]
+            state_sequence = np.argmax(likelihoods, axis=1)
+
+        for g_l in self.goal_locations:
+            ax.scatter(g_l[0], g_l[1], color="black", label="Goal locations")
+
+        mode_data = loc[state_sequence == mode_id, :]
+        ax.scatter(mode_data[:, 0], mode_data[:, 1],
+                   alpha=1, marker=".", s=1, color="red")
+        # ax.set_ylim(30, 230)
+        # ax.set_xlim(70, 300)
+        #ax.set_xlim(self.x_min, self.x_max)
+        plt.xlabel("X (cm)")
+        plt.ylabel("Y (cm)")
+        plt.gca().set_aspect('equal', adjustable='box')
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = OrderedDict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
+        plt.title("State " + str(mode_id))
+        if save_fig:
+            plt.savefig("state_"+str(mode_id)+".svg", transparent="True")
+            plt.rcParams['svg.fonttype'] = 'none'
+        else:
+            plt.show()
+
+    def plot_phmm_state_neural_patterns(self, nr_modes):
+
+        trials_to_use = self.default_trials
+
+        file_name = self.params.session_name + "_" + str(
+            int(self.params.experiment_phase_id[0])) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
+                      "_"+str(trials_to_use[-1])+"_"+str(nr_modes)+"_modes"
+
+        with open(self.params.pre_proc_dir+"phmm/" + file_name + ".pkl", "rb") as file:
+            model = pickle.load(file)
+
+        # get means
+        means = model.means_
+
+        x_max_ = np.max(means.flatten())
+        x_min_ = np.min(means.flatten())
+
+        n_col = 10
+        scaler = 0.1
+        plt.style.use('default')
+        fig = plt.figure(figsize=(8,6))
+        gs = fig.add_gridspec(6, n_col)
+
+        ax1 = fig.add_subplot(gs[:, 0])
+        ax1.imshow(np.expand_dims(means[0, :], 1))
+        ax1.set_xticks([])
+        ax1.set_xlabel(str(0))
+        ax1.set_aspect(scaler)
+        ax1.set_ylabel("CELL ID")
+
+        for i in range(1, n_col-1):
+            ax1 = fig.add_subplot(gs[:, i])
+            a = ax1.imshow(np.expand_dims(means[i,:], 1))
+            ax1.set_xticks([])
+            ax1.set_yticks([], [])
+            ax1.set_xlabel(str(i))
+            ax1.set_aspect(scaler)
+
+        plt.tight_layout()
+        ax1 = fig.add_subplot(gs[:, n_col-1])
+        fig.colorbar(a, cax=ax1)
+        plt.rcParams['svg.fonttype'] = 'none'
+        #plt.show()
+        plt.savefig("state_neural_pattern.svg", transparent="True")
+
+        print("HERE")
+
+    def analyze_modes_spatial_information(self, file_name, mode_ids, plotting=True):
+
+        trials_to_use = self.default_trials
+
+        # get location data from trials
+        nr_cells = self.trial_raster_list[0].shape[0]
+        loc = np.empty((0,2))
+        raster = np.empty((nr_cells, 0))
+        for trial_id in trials_to_use:
+            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
+            loc = np.vstack((loc, self.trial_loc_list[trial_id]))
+
+        state_sequence, nr_modes_, _ = self.decode_poisson_hmm(file_name=file_name,
+                                                           trials_to_use=trials_to_use)
+
+        _, loc_data, _ = self.get_raster_location_speed()
+
+        # only use data from mode ids provided
+        # all_modes_data = loc_data[np.isin(state_sequence, mode_ids), :]
+        # pd_all_modes = upper_tri_without_diag(pairwise_distances(all_modes_data))
+        # all_modes_med_dist = np.median(pd_all_modes)
+
+        med_dist_list = []
+
+        for mode in mode_ids:
+            mode_loc = loc_data[state_sequence == mode, :]
+
+            # compute pairwise distances (euclidean)
+            pd = upper_tri_without_diag(pairwise_distances(mode_loc))
+
+            med_dist = np.median(pd)
+            # std_dist = np.std(np.array(dist_list))
+            med_dist_list.append(med_dist)
+
+            if plotting:
+
+                fig, ax = plt.subplots()
+                ax.scatter(loc_data[:,0], loc_data[:,1], color="gray", s=1, label="TRACKING")
+                ax.scatter(mode_loc[:, 0], mode_loc[:, 1], color="red", label="MODE "+str(mode)+" ASSIGNED", s=1)
+                plt.xlabel("X")
+                plt.ylabel("Y")
+                plt.title("MODE "+str(mode)+"\nMEDIAN DISTANCE: "+ str(np.round(med_dist,2)))
+                plt.legend()
+                plt.show()
+
+        return np.mean(np.array(med_dist_list))
+
+    def phmm_mode_spatial_information_from_model(self, spatial_resolution=1, file_name=None,
+                                            plot_for_control=False):
+        """
+        loads poisson hmm model and weighs rate maps by lambda vectors --> then computes spatial information (sparsity,
+        skaggs information)
+
+        @param spatial_resolution: spatial resolution in cm
+        @type spatial_resolution: int
+        @param nr_modes: nr of modes for model file identification
+        @type nr_modes: int
+        @param file_name: file containing the model --> is used when nr_modes is not provided to identify file
+        @type file_name: string
+        @param plot_for_control: whether to plot intermediate results
+        @type plot_for_control: bool
+        @return: sparsity, skaggs info for each mode
+        """
+
+        print(" - SPATIAL INFORMATION OF PHMM MODES USING MODEL\n")
+
+        if file_name is None:
+            file_name = self.default_phmm
+
+        with open(self.params.pre_proc_dir+"phmm/"+file_name+".pkl", "rb") as file:
+            model = pickle.load(file)
+
+        # get means for all modes (lambda vectors)
+        means = model.means_
+
+        ################################################################################################################
+        # get spatial information of mode by weighing rate maps
+        ################################################################################################################
+
+        # compute rate maps and occupancy
+        rate_maps = self.get_rate_maps(spatial_resolution=spatial_resolution, trials_to_use=None)
+        occ = self.get_occ_map(spatial_resolution=spatial_resolution, trials_to_use=None)
+        prob_occ = occ / occ.sum()
+        # compute binary occupancy map --> used as a mask to filter non-visited bins
+        occ_mask = np.where(occ > 0, 1, np.nan)
+        prob_occ_orig = np.multiply(prob_occ, occ_mask)
+
+        sparsity_list = []
+        skaggs_per_second_list = []
+        skaggs_per_spike_list = []
+
+        # go through all modes
+        for mode_id, means_mode in enumerate(means):
+            # weigh rate map of each cell using mean firing from lambda vector --> compute mean across all cells
+            rate_map_mode_orig = np.mean(rate_maps * means_mode, axis=2)
+            # generate filtered rate map by masking non visited places
+            rate_map_mode_orig = np.multiply(rate_map_mode_orig, occ_mask)
+
+            rate_map_mode = rate_map_mode_orig[~np.isnan(rate_map_mode_orig)]
+            prob_occ = prob_occ_orig[~np.isnan(prob_occ_orig)]
+
+            # need to filter bins with zero firing rate --> otherwise log causes an error
+            rate_map_mode = rate_map_mode[rate_map_mode > 0]
+            prob_occ = prob_occ[rate_map_mode > 0]
+
+            # compute sparsity
+            sparse_mode = (np.sum(prob_occ * rate_map_mode) ** 2) / np.sum(prob_occ * (rate_map_mode ** 2))
+
+            # find good bins so that there is no problem with the log
+            good_bins = (rate_map_mode / rate_map_mode.mean() > 0.0000001)
+            mean_rate = np.sum(rate_map_mode[good_bins] * prob_occ[good_bins])
+            skaggs_info_per_sec = np.sum(rate_map_mode[good_bins] * prob_occ[good_bins] *
+                                         np.log(rate_map_mode[good_bins] / mean_rate))
+            skaggs_info_per_spike = np.sum(rate_map_mode[good_bins] / mean_rate * prob_occ[good_bins] *
+                                           np.log(rate_map_mode[good_bins] / mean_rate))
+
+            skaggs_per_second_list.append(skaggs_info_per_sec)
+            skaggs_per_spike_list.append(skaggs_info_per_spike)
+            sparsity_list.append(sparse_mode)
+            if plot_for_control:
+                # plot random examples
+                rand_float = np.random.randn(1)
+                if rand_float > 0.5:
+                    plt.imshow(rate_map_mode_orig)
+                    plt.colorbar()
+                    plt.title("Sparsity: "+str(sparse_mode)+"\n Skaggs per second: "+str(skaggs_info_per_sec)+
+                              "\n Skaggs per spike: "+ str(skaggs_info_per_spike))
+                    plt.show()
+
+        if plot_for_control:
+            plt.hist(skaggs_per_second_list)
+            plt.title("SKAGGS INFO (PER SECOND)")
+            plt.xlabel("SKAGGS INFO.")
+            plt.ylabel("COUNTS")
+            plt.show()
+
+            plt.hist(skaggs_per_spike_list)
+            plt.title("SKAGGS INFO (PER SPIKE)")
+            plt.xlabel("SKAGGS INFO.")
+            plt.ylabel("COUNTS")
+            plt.show()
+
+            plt.hist(sparsity_list)
+            plt.title("SPARSITY")
+            plt.xlabel("SPARSITY")
+            plt.ylabel("COUNTS")
+            plt.show()
+
+            plt.scatter(skaggs_per_second_list, sparsity_list)
+            plt.title("SKAGGS (PER SEC) vs. SPARSITY\n"+str(pearsonr(skaggs_per_second_list, sparsity_list)))
+            plt.xlabel("SKAGGS (PER SEC)")
+            plt.ylabel("SPARSITY")
+            plt.show()
+
+            plt.scatter(skaggs_per_spike_list, sparsity_list)
+            plt.title("SKAGGS (PER SPIKE) vs. SPARSITY\n"+str(pearsonr(skaggs_per_spike_list, sparsity_list)))
+            plt.xlabel("SKAGGS (PER SPIKE)")
+            plt.ylabel("SPARSITY")
+            plt.show()
+
+            plt.scatter(skaggs_per_second_list, skaggs_per_spike_list)
+            plt.title("SKAGGS (PER SEC) vs. SKAGGS (PER SPIKE)\n"+str(pearsonr(skaggs_per_second_list, skaggs_per_spike_list)))
+            plt.xlabel("SKAGGS (PER SEC)")
+            plt.ylabel("SKAGGS (PER SPIKE)")
+            plt.show()
+
+        return np.array(sparsity_list), np.array(skaggs_per_second_list), np.array(skaggs_per_spike_list)
+
+    def nr_spikes_per_mode(self, trials_to_use=None, nr_modes=None):
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        model = self.load_poisson_hmm(trials_to_use, nr_modes)
+        means = model.means_
+
+        spikes_per_mode = np.sum(means, axis=1)
+        y,_,_ = plt.hist(spikes_per_mode, bins=50)
+        plt.vlines(np.mean(spikes_per_mode), 0, y.max(), colors="r",
+                   label="MEAN: "+str(np.round(np.mean(spikes_per_mode),2)))
+        plt.vlines(np.median(spikes_per_mode), 0, y.max(), colors="blue",
+                   label="MEDIAN: "+str(np.median(spikes_per_mode)))
+        plt.legend()
+        plt.title("#SPIKES PER MODE")
+        plt.xlabel("AVG. #SPIKES PER MODE")
+        plt.ylabel("COUNT")
+        plt.show()
+
+    def decode_awake_activity_spike_binning(self, model_name=None, trials_to_use=None, plot_for_control=False,
+                                   return_results=True, cells_to_use="all"):
+        """
+        decodes sleep activity using pHMM modes/spatial bins from ising model from before and after awake activity and
+        computes similarity measure
+
+        @param model_name: name of file containing the pHMM file
+        @type model_name: str
+        @param plot_for_control: plots intermediate results if True
+        @type plot_for_control: bool
+        @param return_results: whether to return results or not
+        @type return_results: bool
+        @return: pre_prob (probabilities of PRE), post_prob (probabilities of ), event_times (in sec),
+        swr_in_which_n_rem (assignement SWR - nrem phase)
+        @rtype: list, list, list, numpy.array
+        """
+
+        print(" - AWAKE DECODING USING PHMM MODES ...\n")
+        result_dir = "phmm_decoding"
+        # get template file name from parameter file of session if not provided
+        if model_name is None:
+            model_name = self.session_params.default_pre_phmm_model
+
+        if model_name is None:
+            raise Exception("MODEL FILE NOT FOUND\n NOR IN SESSION PARAMETER FILE DEFINED")
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        print("   --> USING TRIALS: "+str(trials_to_use[0])+"-"+str(trials_to_use[-1])+"\n")
+
+        # check that template files are from correct session
+        # --------------------------------------------------------------------------------------------------------------
+
+        file_name = self.session_name +"_"+self.experiment_phase_id +\
+                        "_"+ self.cell_type+"_AWAKE_DEC_"+cells_to_use+".npy"
+
+        # check if PRE and POST result exists already
+        # --------------------------------------------------------------------------------------------------------------
+        if os.path.isfile(self.params.pre_proc_dir + result_dir + "/" + file_name):
+            print(" - RESULTS EXIST ALREADY -- USING EXISTING RESULTS\n")
+        else:
+            # if results don't exist --> compute results
+            # go trough all trials and compute constant #spike bins
+            spike_rasters = []
+
+            for trial_id in trials_to_use:
+                key = "trial"+str(trial_id)
+                # compute spike rasters --> time stamps here are at .whl resolution (20kHz/512 --> 0.0256s)
+                spike_raster = PreProcessAwake(
+                    firing_times=self.data_dic["trial_data"][key]["spike_times"][self.cell_type],
+                    params=self.params, whl=self.data_dic["trial_data"][key]["whl"],
+                    ).spike_binning()
+
+                if plot_for_control:
+                    if random.uniform(0, 1) > 0.5:
+                        plt.imshow(spike_raster, interpolation='nearest', aspect='auto')
+                        plt.title("TRIAL"+str(trial_id)+": CONST. #SPIKES BINNING, 12 SPIKES PER BIN")
+                        plt.xlabel("BIN ID")
+                        a = plt.colorbar()
+                        a.set_label("#SPIKES")
+                        plt.ylabel("CELL ID")
+                        plt.show()
+
+                        plt.imshow(self.trial_raster_list[trial_id], interpolation='nearest', aspect='auto')
+                        plt.title("TIME BINNING, 100ms TIME BINS")
+                        plt.xlabel("TIME BIN ID")
+                        plt.ylabel("CELL ID")
+                        a = plt.colorbar()
+                        a.set_label("#SPIKES")
+                        plt.show()
+
+                spike_rasters.append(spike_raster)
+
+            # load phmm model
+            with open(self.params.pre_proc_dir + "phmm/" + model_name + '.pkl', 'rb') as f:
+                model_dic = pickle.load(f)
+            # get means of model (lambdas) for decoding
+            mode_means = model_dic.means_
+
+            time_bin_size_encoding = model_dic.time_bin_size
+
+            # check if const. #spike bins are correct for the loaded compression factor
+            if not self.params.spikes_per_bin == 12:
+                raise Exception("TRYING TO LOAD COMPRESSION FACTOR FOR 12 SPIKES PER BIN, "
+                                "BUT CURRENT #SPIKES PER BIN != 12")
+
+            # load correct compression factor (as defined in parameter file of the session)
+            if time_bin_size_encoding == 0.01:
+                compression_factor = \
+                    np.round(self.session_params.sleep_compression_factor_12spikes_100ms * 10, 3)
+            elif time_bin_size_encoding == 0.1:
+                compression_factor = self.session_params.sleep_compression_factor_12spikes_100ms
+            else:
+                raise Exception("COMPRESSION FACTOR NEITHER PROVIDED NOR FOUND IN PARAMETER FILE")
+
+            if cells_to_use == "all":
+                cell_selection = "all"
+                cell_ids = np.empty(0)
+
+            else:
+
+                cell_selection = "custom"
+                with open(self.params.pre_proc_dir + "cell_classification/" +
+                          self.session_name +"_"+ self.params.stable_cell_method +".pickle","rb") as f:
+                    class_dic = pickle.load(f)
+
+                if cells_to_use == "stable":
+                    cell_ids = class_dic["stable_cell_ids"]
+                elif cells_to_use == "increasing":
+                    cell_ids = class_dic["increase_cell_ids"]
+                elif cells_to_use == "decreasing":
+                    cell_ids = class_dic["decrease_cell_ids"]
+
+            print(" - DECODING USING " + cells_to_use + " CELLS")
+
+            # decode activity
+            results_list = decode_using_phmm_modes(mode_means=mode_means, event_spike_rasters=spike_rasters,
+                                                   compression_factor=compression_factor, cells_to_use=cell_ids,
+                                                   cell_selection=cell_selection)
+
+            # plot maps of some SWR for control
+            if plot_for_control:
+                for trial_id, res in zip(trials_to_use, results_list):
+                    plt.imshow(np.log(res.T), interpolation='nearest', aspect='auto')
+                    plt.xlabel("POP.VEC. ID")
+                    plt.ylabel("MODE ID")
+                    a = plt.colorbar()
+                    a.set_label("LOG-PROBABILITY")
+                    plt.title("LOG-PROBABILITY MAP: TRIAL "+str(trial_id))
+                    plt.show()
+
+            # saving results
+            # --------------------------------------------------------------------------------------------------
+            # create dictionary with results
+            result_post = {
+                "results_list": results_list,
+            }
+            outfile = open(self.params.pre_proc_dir + result_dir +"/" + file_name, 'wb')
+            pickle.dump(result_post, outfile)
+            print("  - SAVED NEW RESULTS!\n")
+
+        if return_results:
+
+            # load decoded maps
+            result_pre = pickle.load(open(self.params.pre_proc_dir+result_dir + "/" + file_name, "rb"))
+
+            pre_prob = result_pre["results_list"]
+
+            return pre_prob
+
+    def decode_awake_activity_time_binning(self, model_name=None, trials_to_use=None, plot_for_control=False,
+                                   return_results=True, cells_to_use="all"):
+        """
+        decodes sleep activity using pHMM modes/spatial bins from ising model from before and after awake activity and
+        computes similarity measure
+
+        @param model_name: name of file containing the pHMM file
+        @type model_name: str
+        @param plot_for_control: plots intermediate results if True
+        @type plot_for_control: bool
+        @param return_results: whether to return results or not
+        @type return_results: bool
+        @return: pre_prob (probabilities of PRE), post_prob (probabilities of ), event_times (in sec),
+        swr_in_which_n_rem (assignement SWR - nrem phase)
+        @rtype: list, list, list, numpy.array
+        """
+
+        print(" - AWAKE DECODING USING PHMM MODES ...\n")
+        result_dir = "phmm_decoding"
+        # get template file name from parameter file of session if not provided
+        if model_name is None:
+            model_name = self.session_params.default_phmm_model
+
+        if model_name is None:
+            raise Exception("MODEL FILE NOT FOUND\n NOR IN SESSION PARAMETER FILE DEFINED")
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        print("   --> USING TRIALS: "+str(trials_to_use[0])+"-"+str(trials_to_use[-1])+"\n")
+
+        # check that template files are from correct session
+        # --------------------------------------------------------------------------------------------------------------
+
+        file_name = self.session_name +"_"+self.experiment_phase_id +\
+                        "_"+ self.cell_type+"_AWAKE_DEC_"+cells_to_use+"_time_binning"+".npy"
+
+        # check if PRE and POST result exists already
+        # --------------------------------------------------------------------------------------------------------------
+        if os.path.isfile(self.params.pre_proc_dir + result_dir + "/" + file_name):
+            print(" - RESULTS EXIST ALREADY -- USING EXISTING RESULTS\n")
+        else:
+            # if results don't exist --> compute results
+            # go trough all trials and compute constant #spike bins
+            spike_rasters = []
+
+            for trial_id in trials_to_use:
+                key = "trial"+str(trial_id)
+                # compute spike rasters --> time stamps here are at .whl resolution (20kHz/512 --> 0.0256s)
+                spike_raster= PreProcessAwake(
+                    firing_times=self.data_dic["trial_data"][key]["spike_times"][self.cell_type],
+                    params=self.params, whl=self.data_dic["trial_data"][key]["whl"],
+                    ).interval_temporal_binning(interval_start=self.data_dic["trial_timestamps"][0, trial_id],
+                                                interval_end=self.data_dic["trial_timestamps"][1, trial_id],
+                                                interval_freq=0.0256)
+
+                if plot_for_control:
+                    if random.uniform(0, 1) > 0.5:
+                        plt.imshow(spike_raster, interpolation='nearest', aspect='auto')
+                        plt.title("TRIAL"+str(trial_id)+": CONST. #SPIKES BINNING, 12 SPIKES PER BIN")
+                        plt.xlabel("BIN ID")
+                        a = plt.colorbar()
+                        a.set_label("#SPIKES")
+                        plt.ylabel("CELL ID")
+                        plt.show()
+
+                        plt.imshow(self.trial_raster_list[trial_id], interpolation='nearest', aspect='auto')
+                        plt.title("TIME BINNING, 100ms TIME BINS")
+                        plt.xlabel("TIME BIN ID")
+                        plt.ylabel("CELL ID")
+                        a = plt.colorbar()
+                        a.set_label("#SPIKES")
+                        plt.show()
+
+                spike_rasters.append(spike_raster)
+
+            # load phmm model
+            with open(self.params.pre_proc_dir + "phmm/" + model_name + '.pkl', 'rb') as f:
+                model_dic = pickle.load(f)
+            # get means of model (lambdas) for decoding
+            mode_means = model_dic.means_
+
+            time_bin_size_encoding = model_dic.time_bin_size
+
+            if not time_bin_size_encoding == self.params.time_bin_size:
+                raise Exception("Time bin size of model and data are not matching!")
+
+            if cells_to_use == "all":
+                cell_selection = "all"
+                cell_ids = np.empty(0)
+
+            else:
+
+                cell_selection = "custom"
+                with open(self.params.pre_proc_dir + "cell_classification/" +
+                          self.session_name +"_"+ self.params.stable_cell_method +".pickle","rb") as f:
+                    class_dic = pickle.load(f)
+
+                if cells_to_use == "stable":
+                    cell_ids = class_dic["stable_cell_ids"]
+                elif cells_to_use == "increasing":
+                    cell_ids = class_dic["increase_cell_ids"]
+                elif cells_to_use == "decreasing":
+                    cell_ids = class_dic["decrease_cell_ids"]
+
+            print(" - DECODING USING " + cells_to_use + " CELLS")
+
+            # decode activity
+            results_list = decode_using_phmm_modes(mode_means=mode_means, event_spike_rasters=spike_rasters,
+                                                   compression_factor=1, cells_to_use=cell_ids,
+                                                   cell_selection=cell_selection)
+
+            # plot maps of some SWR for control
+            if plot_for_control:
+                for trial_id, res in zip(trials_to_use, results_list):
+                    plt.imshow(np.log(res.T), interpolation='nearest', aspect='auto')
+                    plt.xlabel("POP.VEC. ID")
+                    plt.ylabel("MODE ID")
+                    a = plt.colorbar()
+                    a.set_label("LOG-PROBABILITY")
+                    plt.title("LOG-PROBABILITY MAP: TRIAL "+str(trial_id))
+                    plt.show()
+
+            # saving results
+            # --------------------------------------------------------------------------------------------------
+            # create dictionary with results
+            result_post = {
+                "results_list": results_list,
+            }
+            outfile = open(self.params.pre_proc_dir + result_dir +"/" + file_name, 'wb')
+            pickle.dump(result_post, outfile)
+            print("  - SAVED NEW RESULTS!\n")
+
+        if return_results:
+
+            # load decoded maps
+            result_pre = pickle.load(open(self.params.pre_proc_dir+result_dir + "/" + file_name, "rb"))
+
+            pre_prob = result_pre["results_list"]
+
+            return pre_prob
+
+    def decode_awake_activity_visualization(self, cells_to_use="all", binning="spike_binning"):
+
+        if binning == "spike_binning":
+            results = self.decode_awake_activity_spike_binning(cells_to_use=cells_to_use)
+        elif binning == "time_binning":
+            results = self.decode_awake_activity_time_binning(cells_to_use=cells_to_use)
+
+        a = np.vstack(results)
+        b = np.argmax(a, axis=1)
+
+        mode_ids, nr_counts = np.unique(b, return_counts=True)
+
+
+        fig, ax = plt.subplots()
+
+        lines = []
+        for i in range(mode_ids.shape[0]):
+            pair = [(mode_ids[i], 0), (mode_ids[i], nr_counts[i])]
+            lines.append(pair)
+
+        linecoll = matcoll.LineCollection(lines, colors="lightskyblue")
+
+        ax.add_collection(linecoll)
+        plt.scatter(mode_ids, nr_counts)
+        plt.xlabel("Mode ID")
+        plt.ylabel("Times assigned")
+        plt.title("Awake decoding - "+cells_to_use)
+        plt.show()
+
+        exit()
+
+        sep_array = np.cumsum(np.array([x.shape[0] for x in results]))
+        labels = [str(x) for x in self.params.default_trials]
+
+        results = np.log(np.vstack(results).T)
+
+        rd = multi_dim_scaling(act_mat=results, param_dic=self.params)
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+        plot_2D_scatter(ax=ax, mds=rd, data_sep=sep_array, labels=labels, params=self.params)
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = OrderedDict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
+        plt.show()
+
+    def decode_awake_activity_autocorrelation_spikes_likelihood_vectors(self, plot_for_control=True, plotting=True,
+                                                                        bootstrapping=False, nr_pop_vecs=10, save_fig=False):
+
+        # get likelihood vectors
+        likeli_vecs_list = self.decode_awake_activity_spike_binning()
+        likeli_vecs = np.vstack(likeli_vecs_list)
+        # compute correlations
+        shift_array = np.arange(-1*int(nr_pop_vecs),
+                                     int(nr_pop_vecs)+1)
+
+        auto_corr, _ = cross_correlate_matrices(likeli_vecs.T, likeli_vecs.T, shift_array=shift_array)
+
+        # fitting exponential
+        # --------------------------------------------------------------------------------------------------------------
+        # only take positive part (symmetric) & exclude first data point
+        autocorr_test_data = auto_corr[int(auto_corr.shape[0] / 2):][1:]
+
+        def exponential(x, a, k, b):
+            return a * np.exp(x * k) + b
+
+        popt_exponential_awake, pcov_exponential_awake = optimize.curve_fit(exponential, np.arange(autocorr_test_data.shape[0]),
+                                                                        autocorr_test_data, p0=[1, -0.5, 1])
+
+        if plotting or save_fig:
+
+            if save_fig:
+                plt.style.use('default')
+            plt.plot(shift_array, (auto_corr-auto_corr[-1])/(1-auto_corr[-1]), c="y", label="Awake")
+            plt.xlabel("Shift (#spikes)")
+            plt.ylabel("Avg. Pearson correlation of likelihood vectors")
+            plt.legend()
+            # plt.xticks([-100, -75, -50, -25, 0, 25, 50, 75, 100], np.array([-100, -75, -50, -25, 0, 25, 50, 75, 100]) * 12)
+            if save_fig:
+                plt.rcParams['svg.fonttype'] = 'none'
+                plt.savefig("sim_ratio_autocorr_spikes.svg", transparent="True")
+                plt.close()
+            else:
+                print("HERE")
+                plt.show()
+
+        else:
+            auto_corr_norm = (auto_corr-auto_corr[-1])/(1-auto_corr[-1])
+            return auto_corr, auto_corr_norm, popt_exponential_awake[1]
+
+        # nrem_test_data = auto_corr_nrem[int(auto_corr_nrem.shape[0] / 2)+1:]
+        # rem_test_data = auto_corr_rem[int(auto_corr_rem.shape[0] / 2) + 1:]
+        #
+        # def exponential(x, a, k, b):
+        #     return a * np.exp(x * k) + b
+        #
+        # popt_exponential_rem, pcov_exponential_rem = optimize.curve_fit(exponential, np.arange(rem_test_data.shape[0]),
+        #                                                                 rem_test_data, p0=[1, -0.5, 1])
+        # popt_exponential_nrem, pcov_exponential_nrem = optimize.curve_fit(exponential, np.arange(nrem_test_data.shape[0]),
+        #                                                                 nrem_test_data, p0=[1, -0.5, 1])
+        # if plotting or save_fig:
+        #
+        #     if save_fig:
+        #         plt.style.use('default')
+        #     # plot fits
+        #     plt.text(3, 10, "k = " +str(np.round(popt_exponential_rem[1], 2)), c="red" )
+        #     plt.scatter(np.arange(rem_test_data.shape[0]), rem_test_data, c="salmon", label="REM data")
+        #     plt.plot((np.arange(rem_test_data.shape[0]))[1:], exponential((np.arange(rem_test_data.shape[0]))[1:],
+        #                                                             a=popt_exponential_rem[0], k=popt_exponential_rem[1],
+        #                                                             b=popt_exponential_rem[2]), c="red", label="REM fit")
+        #     plt.text(0.05, 5, "k = " +str(np.round(popt_exponential_nrem[1], 2)), c="blue" )
+        #     plt.scatter(np.arange(nrem_test_data.shape[0]), nrem_test_data, c="lightblue", label="NREM data")
+        #     plt.plot((np.arange(nrem_test_data.shape[0]))[1:], exponential((np.arange(nrem_test_data.shape[0]))[1:],
+        #                                                             a=popt_exponential_nrem[0], k=popt_exponential_nrem[1],
+        #                                                             b=popt_exponential_nrem[2]), c="blue", label="NREM fit")
+        #
+        #     plt.legend(loc=2)
+        #     plt.ylabel("Pearson R (z-scored)")
+        #     plt.xlabel("nr. spikes")
+        #     plt.ylim(-3, 18)
+        #     if save_fig:
+        #         plt.rcParams['svg.fonttype'] = 'none'
+        #         plt.savefig("exponential_fit_spikes.svg", transparent="True")
+        #         plt.close()
+        #     else:
+        #         plt.show()
+        #
+        # if bootstrapping:
+        #
+        #     # bootstrapping
+        #     n_boots = 500
+        #     n_samples_perc = 0.8
+        #
+        #     nrem_exp = []
+        #     rem_exp = []
+        #
+        #     for boots_id in range(n_boots):
+        #         per_ind = np.random.permutation(np.arange(rem_test_data.shape[0]))
+        #         sel_ind = per_ind[:int(n_samples_perc*per_ind.shape[0])]
+        #         # select subset
+        #         x_rem = np.arange(nrem_test_data.shape[0])[sel_ind]
+        #         x_nrem = np.arange(nrem_test_data.shape[0])[sel_ind]
+        #         y_rem = rem_test_data[sel_ind]
+        #         y_nrem = nrem_test_data[sel_ind]
+        #         try:
+        #             popt_exponential_rem, _ = optimize.curve_fit(exponential,x_rem, y_rem, p0=[1, -0.5, 1])
+        #             popt_exponential_nrem, _ = optimize.curve_fit(exponential, x_nrem, y_nrem, p0=[1, -0.5, 1])
+        #         except:
+        #             continue
+        #
+        #         rem_exp.append(popt_exponential_rem[1])
+        #         nrem_exp.append(popt_exponential_nrem[1])
+        #
+        #     if plotting:
+        #         plt.hist(rem_exp, label="rem", color="red", bins=10, density=True)
+        #         plt.xlabel("k from exp. function")
+        #         plt.ylabel("density")
+        #         plt.legend()
+        #         plt.show()
+        #         plt.hist(nrem_exp, label="nrem", color="blue", alpha=0.8, bins=10, density=True)
+        #         # plt.xlim(-2,0.1)
+        #         # plt.title("k from exponential fit (bootstrapped)\n"+"Ttest one-sided: p="+\
+        #         #           str(ttest_ind(rem_exp, nrem_exp, alternative="greater")[1]))
+        #         # plt.xscale("log")
+        #         plt.show()
+        #     else:
+        #         return np.median(np.array(rem_exp)), np.median(np.array(nrem_exp))
+        # else:
+        #     return popt_exponential_rem[1], popt_exponential_nrem[1]
+
+    """#################################################################################################################
+    #  location decoding analysis
+    #################################################################################################################"""
+
+    def decode_location_phmm(self, trial_to_decode, model_name=None, trials_to_use=None, save_fig=False):
+        """
+        decodes awake activity using pHMM modes from same experiment phase
+
+        @param trial_to_decode: which trial to decode
+        @type trial_to_decode: int
+        @param model_name: name of file containing the pHMM file
+        @type model_name: str
+        @param plot_for_control: plots intermediate results if True
+        @type plot_for_control: bool
+        @param return_results: whether to return results or not
+        @type return_results: bool
+        @return: pre_prob (probabilities of PRE), post_prob (probabilities of ), event_times (in sec),
+        swr_in_which_n_rem (assignement SWR - nrem phase)
+        @rtype: list, list, list, numpy.array
+        """
+
+        print(" - DECODE LOCATION USING PHMM MODES ...\n")
+        result_dir = "phmm_decoding"
+        # get template file name from parameter file of session if not provided
+        if model_name is None:
+            model_name = self.session_params.default_pre_phmm_model
+
+        if model_name is None:
+            raise Exception("MODEL FILE NOT FOUND\n NOR IN SESSION PARAMETER FILE DEFINED")
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        print("   --> USING TRIALS: "+str(trials_to_use[0])+"-"+str(trials_to_use[-1])+"\n")
+
+        # check that template files are from correct session
+        # --------------------------------------------------------------------------------------------------------------
+        sess_pre = model_name.split(sep="_")[0]+"_"+model_name.split(sep="_")[1]
+
+        if not (sess_pre == self.session_name):
+            raise Exception("TEMPLATE FILE AND CURRENT SESSION DO NOT MATCH!")
+
+        # load goal locations
+        goal_loc = np.loadtxt(self.params.pre_proc_dir+"goal_locations"+"/"+"mjc163R2R_0114_11.gcoords")
+
+        # get spatial information from pHMM model
+        means, _, _, _, _ = self.fit_spatial_gaussians_for_modes(file_name=model_name)
+
+        # get location data and raster from trial
+        raster = self.trial_raster_list[trial_to_decode]
+        loc = self.trial_loc_list[trial_to_decode]
+
+        model = self.load_poisson_hmm(file_name=model_name)
+
+        prob = model.predict_proba(raster.T)
+
+        # decode activity
+        # prob_poiss = decode_using_phmm_modes(mode_means=model.means_,
+        #                                        event_spike_rasters=[raster],
+        #                                        compression_factor=1)[0]
+        #
+        # prob_poiss_norm = prob_poiss / np.sum(prob_poiss, axis=1, keepdims=True)
+        #
+        # plt.imshow(prob_poiss_norm, interpolation='nearest', aspect='auto')
+        # plt.show()
+        # plt.imshow(prob, interpolation='nearest', aspect='auto')
+        # plt.show()
+
+        if save_fig:
+            plt.style.use('default')
+            err = np.zeros(prob.shape[0])
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+            prev_dec_location = None
+            prev_location = None
+            for i, (current_prob, current_loc) in enumerate(zip(prob, loc)):
+                # compute decoded location using weighted average
+                dec_location = np.average(means, weights=current_prob, axis=1)
+                err[i] = np.linalg.norm(dec_location - current_loc)
+                if i > 1:
+                    # ax.plot([dec_location[0], prev_dec_location[0]], [dec_location[1], prev_dec_location[1]], color="mistyrose",
+                    #         zorder=-1000)
+                    ax.plot([current_loc[0], prev_location[0]], [current_loc[1], prev_location[1]], color="lightgray",
+                            zorder=-1000)
+                ax.scatter(dec_location[0], dec_location[1], color="red", label="Decoded locations")
+                ax.scatter(current_loc[0], current_loc[1], color="lightgray", label="True locations")
+                prev_dec_location = dec_location
+                prev_location = current_loc
+            for g_l in self.goal_locations:
+                ax.scatter(g_l[0], g_l[1], color="black", label="Goals", marker="x")
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = OrderedDict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys())
+            plt.title("Decoding using weighted means")
+            plt.xlabel("X (cm)")
+            plt.ylabel("Y (cm)")
+            plt.ylim(10, 110)
+            plt.xlim(30, 140)
+            plt.rcParams['svg.fonttype'] = 'none'
+            plt.savefig("decoded_locations_phmm.svg", transparent="True")
+            # plt.show()
+            plt.close()
+
+            plt.hist(err, density=True, color="indianred", bins=int(err.shape[0]/5))
+            plt.title("Decoding error")
+            plt.xlabel("Error (cm)")
+            plt.xlim(-5,100)
+            plt.ylabel("Density")
+            plt.rcParams['svg.fonttype'] = 'none'
+            plt.savefig("decoding_error_phmm.svg", transparent="True")
+            # plt.show()
+        else:
+            col_map_red = cm.Reds(np.linspace(0, 1, prob.shape[0]))
+            close_to_goal=np.zeros(prob.shape[0])
+            err = np.zeros(prob.shape[0])
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+
+            for i, (current_prob, current_loc) in enumerate(zip(prob, loc)):
+                # compute decoded location using weighted average
+                dec_location = np.average(means, weights=current_prob, axis=1)
+                err[i] = np.linalg.norm(dec_location - current_loc)
+                ax.scatter(dec_location[0], dec_location[1], color="blue", label="DECODED")
+                ax.scatter(current_loc[0], current_loc[1], color=col_map_red[i], label="TRUE")
+                ax.plot([dec_location[0], current_loc[0]], [dec_location[1], current_loc[1]], color="gray",
+                         zorder=-1000, label="ERRORS")
+                for gl in goal_loc:
+                    if np.linalg.norm(current_loc - gl) < 20:
+                        close_to_goal[i] = 1
+                        ax.scatter(current_loc[0], current_loc[1], facecolors='none', edgecolors="white", label="CLOSE TO GOAL LOC.")
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = OrderedDict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys())
+            plt.title("DECODING USING WEIGHTED MODE MEANS")
+            plt.xlabel("X")
+            plt.ylabel("Y")
+            plt.show()
+            # err = moving_average(a = np.array(err), n=20)
+            plt.plot(err, color="gray", label="ERROR")
+            err = moving_average(a=np.array(err), n=20)
+            plt.plot(err, color="lightcoral", label="ERROR SMOOTHED")
+            plt.plot(close_to_goal*10, color="w", label="CLOSE TO GOAL LOC.")
+            plt.ylabel("ERROR / cm")
+            plt.xlabel("TIME BIN")
+            plt.legend()
+            plt.show()
+
+            sequence = model.decode(raster.T, algorithm="map")[1]
+
+            err = []
+            close_to_goal=np.zeros(sequence.shape[0])
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+            # compute error
+            for i, (mode_act, current_loc) in enumerate(zip(sequence, loc)):
+                ax.scatter(means[0,mode_act], means[1,mode_act], color="blue", label="DECODED")
+                ax.scatter(current_loc[0], current_loc[1], color=col_map_red[i], label="TRUE")
+                ax.plot([means[0,mode_act], current_loc[0]], [means[1,mode_act], current_loc[1]], color="gray",
+                         zorder=-1000, label="ERROR")
+                err.append(np.linalg.norm(means[:,mode_act]-current_loc))
+                for gl in goal_loc:
+                    if np.linalg.norm(current_loc - gl) < 20:
+                        close_to_goal[i] = 1
+                        ax.scatter(current_loc[0], current_loc[1], facecolors='none', edgecolors="white", label="CLOSE TO GOAL LOC.")
+
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = OrderedDict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys())
+            plt.title("DECODING USING MOST LIKELY MODE SEQUENCE")
+            plt.xlabel("X")
+            plt.ylabel("Y")
+            plt.show()
+            # err = moving_average(a = np.array(err), n=20)
+            plt.plot(err, color="gray", label="ERROR")
+            err = moving_average(a=np.array(err), n=20)
+            plt.plot(err, color="lightcoral", label="ERROR SMOOTHED")
+            plt.plot(close_to_goal*10, color="w", label="CLOSE TO GOAL LOC.")
+            plt.legend()
+            plt.ylabel("ERROR / cm")
+            plt.xlabel("TIME BIN")
+            plt.show()
+
+            mean_err = []
+            median_err = []
+
+            for trial_to_decode in trials_to_use:
+                raster = self.trial_raster_list[trial_to_decode]
+                loc = self.trial_loc_list[trial_to_decode]
+                prob = model.predict_proba(raster.T)
+                err = []
+                for i, (current_prob, current_loc) in enumerate(zip(prob, loc)):
+                    # compute decoded location using weighted average
+                    dec_location = np.average(means, weights=current_prob, axis=1)
+                    err.append(np.linalg.norm(dec_location - current_loc))
+
+                mean_err.append(np.mean(np.array(err)))
+                median_err.append(np.median(np.array(err)))
+
+            plt.plot(trials_to_use, mean_err, label="MEAN")
+            plt.plot(trials_to_use, median_err, label="MEDIAN")
+            plt.ylabel("ERROR / cm")
+            plt.xlabel("TRIAL ID")
+            plt.ylim(10,40)
+            plt.legend()
+            plt.show()
+
+    def decode_location_ising(self, trial_to_decode, model_name=None, trials_to_use=None):
+        """
+        decodes awake activity using spatial bins from ising model from same experiment phase
+
+        @param trial_to_decode: which trial to decode
+        @type trial_to_decode: int
+        @param model_name: name of file containing the pHMM file
+        @type model_name: str
+        @param plot_for_control: plots intermediate results if True
+        @type plot_for_control: bool
+        @param return_results: whether to return results or not
+        @type return_results: bool
+        @return: pre_prob (probabilities of PRE), post_prob (probabilities of ), event_times (in sec),
+        swr_in_which_n_rem (assignement SWR - nrem phase)
+        @rtype: list, list, list, numpy.array
+        """
+
+        print(" - DECODE LOCATION USING ISING ...\n")
+
+        # get template file name from parameter file of session if not provided
+        if model_name is None:
+            model_name = self.params.default_pre_ising_model
+
+        if model_name is None:
+            raise Exception("MODEL FILE NOT FOUND\n NOR IN SESSION PARAMETER FILE DEFINED")
+
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+
+        print("   --> USING TRIALS: "+str(trials_to_use[0])+"-"+str(trials_to_use[-1])+"\n")
+
+        # check that template files are from correct session
+        # --------------------------------------------------------------------------------------------------------------
+        sess_pre = model_name.split(sep="_")[0]+"_"+model_name.split(sep="_")[1]
+
+        if not (sess_pre == self.params.session_name):
+            raise Exception("TEMPLATE FILE AND CURRENT SESSION DO NOT MATCH!")
+
+            # load ising template
+        with open(self.params.pre_proc_dir + 'awake_ising_maps/' + model_name + '.pkl',
+                  'rb') as f:
+            model_dic = pickle.load(f)
+
+        # load goal locations
+        goal_loc = np.loadtxt(self.params.pre_proc_dir+"goal_locations"+"/"+"mjc163R2R_0114_11.gcoords")
+
+        # get location data and raster from trial
+        raster = self.trial_raster_list[trial_to_decode]
+        loc = self.trial_loc_list[trial_to_decode]
+
+        # decode activity
+        # get template map
+        template_map = model_dic["res_map"]
+
+        # need actual spatial bin position to do decoding
+        bin_size_x = np.round((self.x_max - self.x_min)/template_map.shape[1], 0)
+        bins_x = np.linspace(self.x_min+bin_size_x/2, self.x_max-bin_size_x/2, template_map.shape[1])
+        # bins_x = np.repeat(bins_x[None, :], template_map.shape[2], axis=0)
+
+        # bins_x = bins_x.reshape(-1, (template_map.shape[1] * template_map.shape[2]))
+
+        bin_size_y = np.round((self.y_max - self.y_min)/template_map.shape[2], 0)
+        bins_y = np.linspace(self.y_min+bin_size_y/2, self.y_max-bin_size_y/2, template_map.shape[2])
+        # bins_y = np.repeat(bins_y[:, None], template_map.shape[1], axis=1)
+
+        # bins_y = bins_y.reshape(-1, (template_map.shape[1] * template_map.shape[2]))
+
+        prob = decode_using_ising_map(template_map=template_map,
+                                              event_spike_rasters=[raster],
+                                              compression_factor=10,
+                                              cell_selection="all")[0]
+
+
+        # prob_poiss_norm = prob_poiss / np.sum(prob_poiss, axis=1, keepdims=True)
+
+        # plt.imshow(prob_poiss_norm, interpolation='nearest', aspect='auto')
+        # plt.show()
+        # plt.imshow(np.log(prob_poiss), interpolation='nearest', aspect='auto')
+        # plt.show()
+
+        col_map_red = cm.Reds(np.linspace(0, 1, prob.shape[0]))
+        close_to_goal=np.zeros(prob.shape[0])
+        err = np.zeros(prob.shape[0])
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+
+        for i, (current_prob, current_loc) in enumerate(zip(prob, loc)):
+
+            prob_map = current_prob.reshape(template_map.shape[1],template_map.shape[2])
+            max_ind = np.unravel_index(prob_map.argmax(), prob_map.shape)
+            # plt.imshow(prob_map.T, origin="lower")
+            # plt.colorbar()
+            # plt.show()
+            # compute decoded location using weighted average
+            dec_location_x = bins_x[max_ind[0]]
+            dec_location_y = bins_y[max_ind[1]]
+            dec_location = np.array([dec_location_x, dec_location_y])
+            err[i] = np.linalg.norm(dec_location - current_loc)
+            ax.scatter(dec_location[0], dec_location[1], color="blue", label="DECODED")
+            ax.scatter(current_loc[0], current_loc[1], color=col_map_red[i], label="TRUE")
+            ax.plot([dec_location[0], current_loc[0]], [dec_location[1], current_loc[1]], color="gray",
+                     zorder=-1000, label="ERRORS")
+            for gl in goal_loc:
+                if np.linalg.norm(current_loc - gl) < 20:
+                    close_to_goal[i] = 1
+                    ax.scatter(current_loc[0], current_loc[1], facecolors='none', edgecolors="white", label="CLOSE TO GOAL LOC.")
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = OrderedDict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
+        plt.title("BAYESIAN DECODING")
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.show()
+        # err = moving_average(a = np.array(err), n=20)
+        plt.plot(err, color="gray", label="ERROR")
+        err = moving_average(a=np.array(err), n=20)
+        plt.plot(err, color="lightcoral", label="ERROR SMOOTHED")
+        plt.plot(close_to_goal*10, color="w", label="CLOSE TO GOAL LOC.")
+        plt.ylabel("ERROR / cm")
+        plt.xlabel("TIME BIN")
+        plt.legend()
+        plt.show()
+
+
+        mean_err = []
+        median_err = []
+
+        for trial_to_decode in trials_to_use:
+            raster = self.trial_raster_list[trial_to_decode]
+            loc = self.trial_loc_list[trial_to_decode]
+            prob = decode_using_ising_map(template_map=template_map,
+                                          event_spike_rasters=[raster],
+                                          compression_factor=10,
+                                          cell_selection="all")[0]
+            err = []
+            for i, (current_prob, current_loc) in enumerate(zip(prob, loc)):
+                # compute decoded location using weighted average
+                prob_map = current_prob.reshape(template_map.shape[1], template_map.shape[2])
+                max_ind = np.unravel_index(prob_map.argmax(), prob_map.shape)
+                # plt.imshow(prob_map.T, origin="lower")
+                # plt.colorbar()
+                # plt.show()
+                # compute decoded location using weighted average
+                dec_location_x = bins_x[max_ind[0]]
+                dec_location_y = bins_y[max_ind[1]]
+                dec_location = np.array([dec_location_x, dec_location_y])
+                err.append(np.linalg.norm(dec_location - current_loc))
+
+            mean_err.append(np.mean(np.array(err)))
+            median_err.append(np.median(np.array(err)))
+
+        plt.plot(trials_to_use, mean_err, label="MEAN")
+        plt.plot(trials_to_use, median_err, label="MEDIAN")
+        plt.ylabel("ERROR / cm")
+        plt.xlabel("TRIAL ID")
+        plt.legend()
+        plt.show()
+
+    def decode_location_bayes(self, cell_subset=None, trials_train=None, trials_test=None, save_fig=False,
+                              plotting=False):
+        """
+        Location decoding using Bayes
+
+        :param trials_train: trials used to generate rate maps
+        :type trials_train: iterable
+        :param trials_test: trials used for testing (pop.vec. & location)
+        :type trials_test: iterable
+        :param save_fig: whether to save figure or not
+        :type save_fig: bool
+        :param plotting: whether to plot results or return results (error)
+        :type plotting: bool
+        :param cell_subset: subset of cells that is used for decoding
+        :type cell_subset: array
+        """
+        print(" - DECODING LOCATION USING BAYESIAN ...\n")
+
+        # if no trials are provided: train/test on default trials without cross-validation
+        if trials_train is None:
+            trials_train = self.default_trials
+        if trials_test is None:
+            trials_test = self.default_trials
+
+        # get train data --> rate maps
+        # --------------------------------------------------------------------------------------------------------------
+        rate_maps = self.get_rate_maps(spatial_resolution=1, trials_to_use=trials_train)
+
+        if cell_subset is not None:
+            rate_maps = rate_maps[:, :, cell_subset]
+
+        # flatten rate maps
+        rate_maps_flat = np.reshape(rate_maps, (rate_maps.shape[0] * rate_maps.shape[1], rate_maps.shape[2]))
+
+        # get test data --> population vectors and location
+        # --------------------------------------------------------------------------------------------------------------
+        raster = []
+        loc = []
+        for trial_id in trials_test:
+            raster.append(self.trial_raster_list[trial_id])
+            loc.append(self.trial_loc_list[trial_id])
+
+        loc = np.vstack(loc)
+        raster = np.hstack(raster)
+
+        if cell_subset is not None:
+            raster = raster[cell_subset, :]
+
+        if plotting or save_fig:
+            plt.style.use('default')
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+
+        decoding_err = []
+        for i, (pop_vec, current_loc) in enumerate(zip(raster.T, loc)):
+            if np.count_nonzero(pop_vec) == 0:
+                continue
+            bl = bayes_likelihood(frm=rate_maps_flat.T, pop_vec=pop_vec, log_likeli=False)
+            bl_area = np.reshape(bl, (rate_maps.shape[0], rate_maps.shape[1]))
+            pred_bin = np.unravel_index(bl_area.argmax(), bl_area.shape)
+            pred_x = pred_bin[0] + self.x_min
+            pred_y = pred_bin[1] + self.y_min
+            dec_location = np.array([pred_x, pred_y])
+            decoding_err.append(np.sqrt((pred_x - current_loc[0]) ** 2 + (pred_y - current_loc[1]) ** 2))
+
+            if plotting or save_fig:
+                ax.scatter(dec_location[0], dec_location[1], color="red", label="Decoded locations")
+                ax.scatter(current_loc[0], current_loc[1], color="lightgray", label="True locations")
+
+        if plotting or save_fig:
+            for g_l in self.goal_locations:
+                ax.scatter(g_l[0], g_l[1], color="black", label="Goals", marker="x")
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = OrderedDict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys())
+            plt.title("Bayesian decoding")
+            plt.xlabel("X (cm)")
+            plt.ylabel("Y (cm)")
+            plt.ylim(10, 110)
+            plt.xlim(30, 140)
+            if save_fig:
+                plt.rcParams['svg.fonttype'] = 'none'
+                plt.savefig("decoded_locations_bayes.svg", transparent="True")
+                plt.close()
+            else:
+                plt.show()
+
+            decoding_err = np.array(decoding_err)
+            plt.hist(decoding_err, density=True, color="indianred", bins=int(decoding_err.shape[0]/5))
+            plt.title("Decoding error")
+            plt.xlabel("Error (cm)")
+            plt.ylabel("Density")
+            plt.xlim(-5, 100)
+            if save_fig:
+                plt.rcParams['svg.fonttype'] = 'none'
+                plt.savefig("decoding_error_bayes.svg", transparent="True")
+            else:
+                plt.show()
+
+        if (not plotting) & (not save_fig):
+            return decoding_err
+
+
+"""#####################################################################################################################
+#   CHEESEBOARD CLASS
+#####################################################################################################################"""
+
+
+class Cheeseboard(TrialParentClass):
+    """Base class for cheese board task data analysis
+
+       ATTENTION: this is only used for the task data --> otherwise use Sleep class!
+
+    """
+
+    def __init__(self, data_dic, cell_type, params, session_params, experiment_phase=None):
+        """
+        initializes cheeseboard class
+
+        :param data_dic: dictionary containing spike data
+        :type data_dic: python dic
+        :param cell_type: which cell type to use
+        :type cell_type: str
+        :param params: general analysis params
+        :type params: class
+        :param session_params: sessions specific params
+        :type session_params: class
+        :param exp_phase_id: which experiment phase id
+        :type exp_phase_id: int
+        """
+
+        # get attributes from parent class
+        TrialParentClass.__init__(self, data_dic, cell_type, params, session_params, experiment_phase)
+
+        # --------------------------------------------------------------------------------------------------------------
+        # get phase specific info (ID & description)
+        # --------------------------------------------------------------------------------------------------------------
+
+
+        # compression factor:
+        #
+        # compression factor used for sleep decoding --> e.g when we use constant #spike bins with 12 spikes
+        # we need to check how many spikes we have in e.g. 100ms windows if this was used for awake encoding
+        # if we have a mean of 30 spikes for awake --> compression factor = 12/30 --> 0.4
+        # is used to scale awake activity to fit sleep activity
+        # --------------------------------------------------------------------------------------------------------------
+
+        if cell_type == "p1_l":
+            self.session_params.sleep_compression_factor_12spikes_100ms = \
+                self.session_params.sleep_compression_factor_12spikes_100ms_p1_l
+        elif cell_type == "p1_r":
+            self.session_params.sleep_compression_factor_12spikes_100ms = \
+                self.session_params.sleep_compression_factor_12spikes_100ms_p1_r
+        else:
+            self.session_params.sleep_compression_factor_12spikes_100ms = \
+                self.session_params.sleep_compression_factor_12spikes_100ms
+
+        # default models for behavioral data
+        # --------------------------------------------------------------------------------------------------------------
+
+        if cell_type == "p1_l":
+            self.session_params.default_pre_phmm_model = self.session_params.default_pre_phmm_model_p1_l
+            self.session_params.default_post_phmm_model = self.session_params.default_post_phmm_model_p1_l
+            self.session_params.default_pre_ising_model = self.session_params.default_pre_ising_model_p1_l
+            self.session_params.default_post_ising_model = self.session_params.default_post_ising_model_p1_l
+        elif cell_type == "p1_r":
+            self.session_params.default_pre_phmm_model = self.session_params.default_pre_phmm_model_p1_r
+            self.session_params.default_post_phmm_model = self.session_params.default_post_phmm_model_p1_r
+            self.session_params.default_pre_ising_model = self.session_params.default_pre_ising_model_p1_r
+            self.session_params.default_post_ising_model = self.session_params.default_post_ising_model_p1_r
+        else:
+            self.session_params.default_pre_phmm_model = self.session_params.default_pre_phmm_model
+            self.session_params.default_post_phmm_model = self.session_params.default_post_phmm_model
+            self.session_params.default_pre_ising_model = self.session_params.default_pre_ising_model
+            self.session_params.default_post_ising_model = self.session_params.default_post_ising_model
+
+        # goal locations
+        # --------------------------------------------------------------------------------------------------------------
+        try:
+            self.goal_locations = self.session_params.goal_locations
+        except:
+            print("GOAL LOCATIONS NOT FOUND")
+
+        # convert goal locations from a.u. to cm
+        self.goal_locations = np.array(self.goal_locations) * self.spatial_factor
+
+        # get pre-selected trials (e.g. last 10 min of learning 1 and first 10 min of learning 2)
+        # --------------------------------------------------------------------------------------------------------------
+        if session_params.experiment_phase == "learning_cheeseboard_1":
+            self.default_trials = self.session_params.default_trials_lcb_1
+            self.default_ising = self.session_params.default_pre_ising_model
+            self.default_phmm = self.session_params.default_pre_phmm_model
+            self.default_phmm_stable = self.session_params.default_pre_phmm_model_stable
+        elif session_params.experiment_phase == "learning_cheeseboard_2":
+            self.default_trials = self.session_params.default_trials_lcb_2
+            self.default_ising = self.session_params.default_post_ising_model
+            self.default_phmm = self.session_params.default_post_phmm_model
+
+
+        # compute raster, location speed
+        # --------------------------------------------------------------------------------------------------------------
+        self.trial_loc_list = []
+        self.trial_raster_list = []
+        self.trial_speed_list = []
+
+        # get x-max from start box --> discard all data that is smaller than x-max
+        x_max_sb = self.session_params.data_params_dictionary["start_box_coordinates"][1] * self.spatial_factor
+
+        # compute center of cheeseboard (x_max_sb + 110 cm, assumption: cheeseboard diameter: 220cm)
+        x_c = x_max_sb + 110 * self.spatial_factor
+
+        # use center of start box to find y coordinate of center of cheeseboard
+        y_c = self.session_params.data_params_dictionary["start_box_coordinates"][2]+ \
+              (self.session_params.data_params_dictionary["start_box_coordinates"][3] - \
+              self.session_params.data_params_dictionary["start_box_coordinates"][2])/2
+
+        cb_center = np.expand_dims(np.array([x_c, y_c]), 0)
+
+        # compute raster, location & speed for each trial
+        for trial_id, key in enumerate(self.data_dic["trial_data"]):
+            # compute raster, location and speed data
+            raster, loc, speed = PreProcessAwake(firing_times=self.data_dic["trial_data"][key]["spike_times"][cell_type],
+                                                 params=self.params, whl=self.data_dic["trial_data"][key]["whl"],
+                                                 spatial_factor=self.spatial_factor
+                                                 ).interval_temporal_binning_raster_loc_vel(
+                interval_start=self.data_dic["trial_timestamps"][0,trial_id],
+                interval_end=self.data_dic["trial_timestamps"][1,trial_id])
+
+            # TODO: improve filtering of spatial locations outside cheeseboard
+            if self.params.additional_spatial_filter:
+                # filter periods that are outside the cheeseboard
+                dist_from_center = distance.cdist(loc, cb_center, metric="euclidean")
+
+                raster = np.delete(raster, np.where(dist_from_center > 110* self.spatial_factor), axis=1)
+                speed = np.delete(speed, np.where(dist_from_center > 110* self.spatial_factor))
+                loc = np.delete(loc, np.where(dist_from_center > 110* self.spatial_factor), axis=0)
+
+            # TODO delete this section below
+            # if self.session_name == "mjc163R4R_0114":
+            #     dist_from_center = distance.cdist(loc, cb_center, metric="euclidean")
+            #
+            #     raster = np.delete(raster, np.where(dist_from_center > 110* self.spatial_factor), axis=1)
+            #     speed = np.delete(speed, np.where(dist_from_center > 110* self.spatial_factor))
+            #     loc = np.delete(loc, np.where(dist_from_center > 110* self.spatial_factor), axis=0)
+
+            # if self.session_name == "mjc148R4R_0113":
+            #     raster = np.delete(raster, np.where(loc[:,0] < 85* self.spatial_factor), axis=1)
+            #     speed = np.delete(speed, np.where(loc[:, 0] < 85* self.spatial_factor))
+            #     loc = np.delete(loc, np.where(loc[:, 0] < 85), axis=0)
+
+            if self.session_name in ["mjc163R2R_0114", "mjc163R4R_0114", "mjc169R4R_0114", "mjc163R1L_0114",
+                                     "mjc163R3L_0114", "mjc169R1R_0114"]:
+                raster = np.delete(raster, np.where(loc[:,0] < x_max_sb), axis=1)
+                speed = np.delete(speed, np.where(loc[:, 0] < x_max_sb))
+                loc = np.delete(loc, np.where(loc[:, 0] < x_max_sb), axis=0)
+
+            # update environment dimensions
+            self.x_min = min(self.x_min, min(loc[:,0]))
+            self.x_max = max(self.x_max, max(loc[:, 0]))
+            self.y_min = min(self.y_min, min(loc[:,1]))
+            self.y_max = max(self.y_max, max(loc[:, 1]))
+
+            self.trial_raster_list.append(raster)
+            self.trial_loc_list.append(loc)
+            self.trial_speed_list.append(speed)
+
+    """#################################################################################################################
+    #  Plotting methods
+    #################################################################################################################"""
+
+    def plot_tracking_and_goals(self, ax=None, trials_to_use=None):
+        if trials_to_use is None:
+            trials_to_use = self.default_trials
+        if ax is None:
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+
+        # get location data from trials
+        nr_cells = self.trial_raster_list[0].shape[0]
+        loc = np.empty((0,2))
+        raster = np.empty((nr_cells, 0))
+        for trial_id in trials_to_use:
+            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
+            loc = np.vstack((loc, self.trial_loc_list[trial_id]))
+        ax.scatter(loc[:, 0], loc[:, 1], color="grey", s=1, label="TRACKING")
+
+        # plot actual trajectory
+        for part in range(loc.shape[0]-1):
+            ax.plot(loc[part:part+2, 0], loc[part:part+2, 1], color="red")
+
+        for g_l in self.goal_locations:
+            ax.scatter(g_l[0], g_l[1], marker="x", color="w", label="GOALS")
+        plt.show()
+
+    def plot_tracking_and_goals_first_or_last_trial(self, ax=None, save_fig=False, trial="first"):
+
+        if save_fig:
+            plt.style.use('default')
+        if trial=="first":
+            trials_to_use = [0]
+        elif trial =="last":
+            trials_to_use = [len(self.trial_raster_list) - 1]
+        else:
+            raise Exception("Define [first] or [last] trial")
+
+        if ax is None:
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+
+        # get location data from trials
+        nr_cells = self.trial_raster_list[0].shape[0]
+        loc = np.empty((0,2))
+        raster = np.empty((nr_cells, 0))
+        for trial_id in trials_to_use:
+            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
+            loc = np.vstack((loc, self.trial_loc_list[trial_id]))
+        # ax.scatter(loc[:, 0], loc[:, 1], color="lightblue", s=1, label="TRACKING")
+
+        # plot actual trajectory
+        for part in range(loc.shape[0]-1):
+            ax.plot(loc[part:part+2, 0], loc[part:part+2, 1], color="lightblue", label="Tracking")
+
+        for g_l in self.goal_locations:
+            ax.scatter(g_l[0], g_l[1], color="black", label="Goals")
+
+        plt.gca().set_aspect('equal', adjustable='box')
+        handles, labels = plt.gca().get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        plt.legend(by_label.values(), by_label.keys())
+        plt.xlim(20, 160)
+        plt.ylim(10, 130)
+        plt.xlabel("X (cm)")
+        plt.ylabel("Y (cm)")
+
+        if save_fig:
+            plt.rcParams['svg.fonttype'] = 'none'
+            plt.savefig(self.experiment_phase+"_tracking_"+trial+"_trial.svg", transparent="True")
+            plt.close()
+        else:
+            plt.show()
+
+    """#################################################################################################################
+    #  Saving methods
+    #################################################################################################################"""
+
+    def save_goal_coding_all_modes(self, nr_modes, out_file_name):
+
+        trials_to_use = self.default_trials
+
+        file_name = self.session_name + "_" + str(
+            int(self.params.experiment_phase_id[0])) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
+                      "_"+str(trials_to_use[-1])+"_"+str(nr_modes)+"_modes"
+
+        frac_per_mode = []
+        for mode_id in range(nr_modes):
+            frac_close_to_goal = self.analyze_modes_goal_coding(file_name=file_name, mode_ids=mode_id)
+            frac_per_mode.append(frac_close_to_goal)
+
+        np.save(out_file_name, np.array(frac_per_mode))
+        plt.hist(frac_per_mode, bins=20)
+        plt.xlabel("FRACTION AROUND GOAL")
+        plt.ylabel("COUNT")
+        plt.show()
 
     """#################################################################################################################
     #  learning
@@ -9991,723 +11849,6 @@ class Cheeseboard:
     #  poisson hmm
     #################################################################################################################"""
 
-    def cross_val_poisson_hmm(self, trials_to_use=None, cl_ar=np.arange(1, 50, 5), cells_to_use="all_cells"):
-        # --------------------------------------------------------------------------------------------------------------
-        # cross validation of poisson hmm fits to data
-        #
-        # args:     - cl_ar, range object: #clusters to fit to data
-        # --------------------------------------------------------------------------------------------------------------
-
-        print(" - CROSS-VALIDATING POISSON HMM ON CHEESEBOARD --> OPTIMAL #MODES ...")
-        print("  - nr modes to compute: "+str(cl_ar))
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        print("   --> USING TRIALS: "+str(trials_to_use[0])+"-"+str(trials_to_use[-1])+"\n")
-
-        # check how many cells
-        nr_cells = self.trial_raster_list[0].shape[0]
-        raster = np.empty((nr_cells, 0))
-
-        trial_lengths = []
-        for trial_id in trials_to_use:
-            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
-            trial_lengths.append(self.trial_raster_list[trial_id].shape[1])
-
-        # if subset of cells to use
-        if cells_to_use == "stable_cells":
-            # load cell labels
-            with open(self.params.pre_proc_dir + "cell_classification/" +
-                      self.session_name + "_" + self.params.stable_cell_method + ".pickle", "rb") as f:
-                class_dic = pickle.load(f)
-
-            stable_cells = class_dic["stable_cell_ids"].flatten()
-            raster = raster[stable_cells, :]
-
-        elif cells_to_use == "decreasing_cells":
-                        # load cell labels
-            with open(self.params.pre_proc_dir + "cell_classification/" +
-                      self.session_name + "_" + self.params.stable_cell_method + ".pickle", "rb") as f:
-                class_dic = pickle.load(f)
-
-            dec_cells = class_dic["decrease_cell_ids"].flatten()
-            raster = raster[dec_cells, :]
-
-        if self.params.cross_val_splits == "trial_splitting":
-            trial_end = np.cumsum(np.array(trial_lengths))
-            trial_start = np.concatenate([[0], trial_end[:-1]])
-            # test_range = np.vstack((trial_start, trial_end))
-            test_range_per_fold = []
-            for lo, hi in zip(trial_start, trial_end):
-                test_range_per_fold.append(np.array(list(range(lo, hi))))
-
-        elif self.params.cross_val_splits == "custom_splits":
-
-            # number of folds
-            nr_folds = 10
-            # how many times to fit for each split
-            max_nr_fitting = 5
-            # how many chunks (for pre-computed splits)
-            nr_chunks = 10
-
-            unobserved_lo_array = pickle.load(
-                open("temp_data/unobserved_lo_cv" + str(nr_folds) + "_" + str(nr_chunks) + "_chunks", "rb"))
-            unobserved_hi_array = pickle.load(
-                open("temp_data/unobserved_hi_cv" + str(nr_folds) + "_" + str(nr_chunks) + "_chunks", "rb"))
-
-            # set number of time bins
-            bin_num = raster.shape[1]
-            bins = np.arange(bin_num + 1)
-
-            # length of one chunk
-            n_chunks = int(bin_num / nr_chunks)
-            test_range_per_fold = []
-            for fold in range(nr_folds):
-
-                # unobserved_lo: start bins (in spike data resolution) for all test data chunks
-                unobserved_lo = []
-                unobserved_hi = []
-                for lo, hi in zip(unobserved_lo_array[fold], unobserved_hi_array[fold]):
-                    unobserved_lo.append(bins[lo * n_chunks])
-                    unobserved_hi.append(bins[hi * n_chunks])
-
-                unobserved_lo = np.array(unobserved_lo)
-                unobserved_hi = np.array(unobserved_hi)
-
-                test_range = []
-                for lo, hi in zip(unobserved_lo, unobserved_hi):
-                    test_range += (list(range(lo, hi)))
-                test_range_per_fold.append(np.array(test_range))
-
-        nr_cores = 12
-
-        folder_name = self.session_name +"_"+self.experiment_phase_id+"_"+self.cell_type+\
-                      "_trials_"+str(trials_to_use[0])+"_"+str(trials_to_use[-1])
-
-        new_ml = MlMethodsOnePopulation(params=self.params)
-        new_ml.parallelize_cross_val_model(nr_cluster_array=cl_ar, nr_cores=nr_cores, model_type="pHMM",
-                                           raster_data=raster, folder_name=folder_name, splits=test_range_per_fold,
-                                           cells_used=cells_to_use)
-        # new_ml.cross_val_view_results(folder_name=folder_name)
-
-    def plot_custom_splits(self):
-        new_ml = MlMethodsOnePopulation(params=self.params)
-        new_ml.plot_custom_splits()
-
-    def find_and_fit_optimal_number_of_modes(self, cells_to_use="all_cells", cl_ar_init = np.arange(1, 50, 5)):
-        # compute likelihoods with standard spacing first
-        self.cross_val_poisson_hmm(cells_to_use=cells_to_use, cl_ar=cl_ar_init)
-        # get optimal number of modes for coarse grained
-        trials_to_use = self.default_trials
-        folder_name = self.session_name + "_" + str(
-            int(self.experiment_phase_id)) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
-                      "_"+str(trials_to_use[-1])
-        new_ml = MlMethodsOnePopulation(params=self.params)
-        opt_nr_coarse = new_ml.get_optimal_mode_number(folder_name=folder_name, cells_used=cells_to_use)
-        print("Coarse opt. number of modes: "+str(opt_nr_coarse))
-        self.cross_val_poisson_hmm(cells_to_use=cells_to_use, cl_ar=np.arange(opt_nr_coarse - 2, opt_nr_coarse + 3, 2))
-        opt_nr_fine = new_ml.get_optimal_mode_number(folder_name=folder_name, cells_used=cells_to_use)
-        print("Fine opt. number of modes: " + str(opt_nr_fine))
-        self.fit_poisson_hmm(nr_modes=opt_nr_fine, cells_to_use=cells_to_use)
-
-    def view_cross_val_results(self, trials_to_use=None, range_to_plot=None, save_fig=False, cells_used="all_cells"):
-        # --------------------------------------------------------------------------------------------------------------
-        # views cross validation results
-        #
-        # args:     - model_type, string: which type of model ("POISSON_HMM")
-        #           - custom_splits, bool: whether custom splits were used for cross validation
-        # --------------------------------------------------------------------------------------------------------------
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        folder_name = self.session_name + "_" + str(
-            int(self.experiment_phase_id[0])) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
-                      "_"+str(trials_to_use[-1])
-        new_ml = MlMethodsOnePopulation(params=self.params)
-        new_ml.cross_val_view_results(folder_name=folder_name, range_to_plot=range_to_plot, save_fig=save_fig, 
-                                      cells_used=cells_used)
-
-    def fit_poisson_hmm(self, nr_modes, trials_to_use=None, cells_to_use="all_cells"):
-        # --------------------------------------------------------------------------------------------------------------
-        # fits poisson hmm to data
-        #
-        # args:     - nr_modes, int: #clusters to fit to data
-        #           - file_identifier, string: string that is added at the end of file for identification
-        # --------------------------------------------------------------------------------------------------------------
-
-        print(" - FITTING POISSON HMM WITH "+str(nr_modes)+" MODES ...\n")
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        # check how many cells
-        nr_cells = self.trial_raster_list[0].shape[0]
-        raster = np.empty((nr_cells, 0))
-
-        for trial_id in trials_to_use:
-            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
-
-        # if subset of cells to use
-        if cells_to_use == "stable_cells":
-            # load cell labels
-            with open(self.params.pre_proc_dir + "cell_classification/" +
-                      self.session_name + "_" + self.params.stable_cell_method + ".pickle", "rb") as f:
-                class_dic = pickle.load(f)
-
-            stable_cells = class_dic["stable_cell_ids"].flatten()
-            raster = raster[stable_cells, :]
-
-        elif cells_to_use == "decreasing_cells":
-                        # load cell labels
-            with open(self.params.pre_proc_dir + "cell_classification/" +
-                      self.session_name + "_" + self.params.stable_cell_method + ".pickle", "rb") as f:
-                class_dic = pickle.load(f)
-
-            dec_cells = class_dic["decrease_cell_ids"].flatten()
-            raster = raster[dec_cells, :]
-
-        log_li = -1*np.inf
-        # fit 10 times to select model with best highest log-likelihood (NOT CROSS-VALIDATED!!!)
-        for i in range(10):
-            test_model = PoissonHMM(n_components=nr_modes)
-            test_model.fit(raster.T)
-            log_li_test = test_model.score(raster.T)
-            if log_li_test > log_li:
-                model = test_model
-                log_li = log_li_test
-
-        model.set_time_bin_size(time_bin_size=self.params.time_bin_size)
-
-        if cells_to_use == "stable_cells":
-            save_dir = self.params.pre_proc_dir+"phmm/stable_cells/"
-        elif cells_to_use == "decreasing_cells":
-            save_dir = self.params.pre_proc_dir+"phmm/decreasing_cells/"
-        elif cells_to_use == "all_cells":
-            save_dir = self.params.pre_proc_dir+"phmm/"
-        file_name = self.session_name + "_" + str(
-            int(self.experiment_phase_id)) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
-                      "_"+str(trials_to_use[-1])+"_"+str(nr_modes)+"_modes"
-
-        with open(save_dir+file_name+".pkl", "wb") as file: pickle.dump(model, file)
-
-        print("  - ... DONE!\n")
-
-    def evaluate_poisson_hmm(self, nr_modes, trials_to_use=None, save_fig=False):
-        # --------------------------------------------------------------------------------------------------------------
-        # fits poisson hmm to data and evaluates the goodness of the model by comparing basic statistics (avg. firing
-        # rate, correlation values, k-statistics) between real data and data sampled from the model
-        #
-        # args:     - nr_modes, int: #clusters to fit to data
-        #           - load_from_file, bool: whether to load model from file or to fit model again
-        # --------------------------------------------------------------------------------------------------------------
-
-        print(" - EVALUATING POISSON HMM FIT (BASIC STATISTICS) ...")
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        # check how many cells
-        nr_cells = self.trial_raster_list[0].shape[0]
-        raster = np.empty((nr_cells, 0))
-        for trial_id in trials_to_use:
-            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
-        nr_time_bins = raster.shape[1]
-        # X = X[:, :1000]
-
-        file_name = self.session_name + "_" + str(
-            int(self.experiment_phase_id[0])) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
-                      "_"+str(trials_to_use[-1])+"_"+str(nr_modes)+"_modes"
-
-        # check if model file exists already --> otherwise fit model again
-        if os.path.isfile(self.params.pre_proc_dir+"phmm/" + file_name + ".pkl"):
-            print("- LOADING PHMM MODEL FROM FILE\n")
-            with open(self.params.pre_proc_dir+"phmm/" + file_name + ".pkl", "rb") as file:
-                model = pickle.load(file)
-        else:
-            print("- PHMM MODEL FILE NOT FOUND --> FITTING PHMM TO DATA\n")
-            model = PoissonHMM(n_components=nr_modes)
-            model.fit(raster.T)
-
-        samples, sequence = model.sample(nr_time_bins*50)
-        samples = samples.T
-
-        if save_fig:
-            mean_dic, corr_dic, k_dic = evaluate_clustering_fit(real_data=raster, samples=samples, binning="TEMPORAL_SPIKE",
-                                   time_bin_size=0.1, plotting=False)
-
-            plt.style.use('default')
-            k_samples_sorted = np.sort(k_dic["samples"])
-            k_data_sorted = np.sort(k_dic["real"])
-
-            p_samples = 1. * np.arange(k_samples_sorted.shape[0]) / (k_samples_sorted.shape[0] - 1)
-            p_data = 1. * np.arange(k_data_sorted.shape[0]) / (k_data_sorted.shape[0] - 1)
-            # plt.hlines(0.5, -0.02, 0.85, color="gray", linewidth=0.5)
-            plt.plot(k_data_sorted, p_data, color="darkorange", label="Data")
-            plt.plot(k_samples_sorted, p_samples, color="bisque", label="Model")
-            plt.ylabel("CDF")
-            plt.xlabel("% active cells per time bin")
-            plt.legend()
-            plt.title("Model quality: k-statistic")
-            make_square_axes(plt.gca())
-
-            plt.rcParams['svg.fonttype'] = 'none'
-            plt.savefig("model_qual_k.svg", transparent="True")
-            plt.close()
-
-            # plot single figures
-            plt.plot([-0.2, max(np.maximum(corr_dic["samples"].flatten(), corr_dic["real"].flatten()))],
-                     [-0.2,max(np.maximum(corr_dic["samples"].flatten(),corr_dic["real"].flatten()))],
-                     linestyle="dashed", c="gray")
-            plt.scatter(corr_dic["samples"].flatten(), corr_dic["real"].flatten(), color="pink")
-            plt.xlabel("Correlations (samples)")
-            plt.ylabel("Correlations (data)")
-            plt.title("Model quality: correlations ")
-            plt.text(0.0, 0.9, "R = " + str(round(corr_dic["corr"][0], 4)))
-            make_square_axes(plt.gca())
-            plt.rcParams['svg.fonttype'] = 'none'
-            plt.savefig("model_qual_correlations.svg", transparent="True")
-            plt.close()
-
-            # plot single figures
-            plt.plot([0, max(np.maximum(mean_dic["samples"].flatten(), mean_dic["real"].flatten()))],
-                     [0,max(np.maximum(mean_dic["samples"].flatten(),mean_dic["real"].flatten()))],
-                     linestyle="dashed", c="gray")
-            plt.scatter(mean_dic["samples"].flatten(), mean_dic["real"].flatten(), color="turquoise")
-            plt.xlabel("Mean firing rate (samples)")
-            plt.ylabel("Mean firing rate (data)")
-            plt.title("Model quality: mean firing ")
-            plt.text(1.2, 12, "R = " + str(round(mean_dic["corr"][0], 4)))
-            make_square_axes(plt.gca())
-            # plt.show()
-            plt.rcParams['svg.fonttype'] = 'none'
-            plt.savefig("model_qual_mean_firing.svg", transparent="True")
-            plt.close()
-        else:
-
-            evaluate_clustering_fit(real_data=raster, samples=samples, binning="TEMPORAL_SPIKE",
-                                    time_bin_size=0.1, plotting=True)
-
-    def evaluate_multiple_poisson_hmm_models(self, nr_modes_range, trials_to_use=None):
-        # --------------------------------------------------------------------------------------------------------------
-        # fits poisson hmm to data and evaluates the goodness of the model by comparing basic statistics (avg. firing
-        # rate, correlation values, k-statistics) between real data and data sampled from the model
-        #
-        # args:     - nr_modes, int: #clusters to fit to data
-        #           - load_from_file, bool: whether to load model from file or to fit model again
-        # --------------------------------------------------------------------------------------------------------------
-
-        print("- EVALUATING POISSON HMM FIT (BASIC STATISTICS) ...")
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        # check how many cells
-        nr_cells = self.trial_raster_list[0].shape[0]
-        raster = np.empty((nr_cells, 0))
-        for trial_id in trials_to_use:
-            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
-        nr_time_bins = raster.shape[1]
-        # X = X[:, :1000]
-
-        mean_res = []
-        corr_res = []
-        k_res = []
-
-        for nr_modes in nr_modes_range:
-            fit_mean_res = []
-            fit_corr_res = []
-            fit_k_res = []
-            for nr_fit in range(10):
-                print(" - FITTING PHMM MODEL WITH "+str(nr_modes)+" MODES - FIT NR: "+str(nr_fit))
-                model = PoissonHMM(n_components=nr_modes)
-                model.fit(raster.T)
-
-                samples, sequence = model.sample(nr_time_bins*50)
-                samples = samples.T
-                mean_dic, corr_dic, k_dic = evaluate_clustering_fit(real_data=raster, samples=samples,
-                                                                    binning="TEMPORAL_SPIKE",
-                                                                    time_bin_size=0.1, plotting=False)
-                fit_mean_res.append(mean_dic["corr"][0])
-                fit_corr_res.append(corr_dic["corr_triangles"][0])
-                fit_k_res.append(k_dic["diff_med"])
-
-
-            mean_res.append([np.mean(np.array(fit_mean_res)), np.std(np.array(fit_mean_res))])
-            corr_res.append([np.mean(np.array(fit_corr_res)), np.std(np.array(fit_corr_res))])
-            k_res.append([np.mean(np.array(fit_k_res)), np.std(np.array(fit_k_res))])
-
-        mean_res = np.array(mean_res)
-        corr_res = np.array(corr_res)
-        k_res = np.array(k_res)
-
-        # plot results
-        plt.figure(figsize=(5,10))
-        plt.subplot(3,1,1)
-        plt.errorbar(nr_modes_range, mean_res[:,0],yerr=mean_res[:,1], color="r")
-        plt.grid(color="gray")
-        plt.ylabel("PEARSON R: MEAN FIRING")
-        plt.ylim(min(mean_res[:,0])-max(mean_res[:,1]), max(mean_res[:,0])+max(mean_res[:,1]))
-        plt.subplot(3,1,2)
-        plt.errorbar(nr_modes_range, corr_res[:,0],yerr=corr_res[:,1], color="r")
-        plt.ylabel("PEARSON R: CORR")
-        plt.grid(color="gray")
-        plt.ylim(min(corr_res[:,0])-max(corr_res[:,1]), max(corr_res[:,0])+max(corr_res[:,1]))
-        plt.subplot(3,1,3)
-        plt.errorbar(nr_modes_range, k_res[:,0],yerr=k_res[:,1], color="r")
-        plt.ylabel("DIFF. MEDIANS")
-        plt.xlabel("NR. MODES")
-        plt.grid(color="gray")
-        plt.ylim(min(k_res[:,0])-max(k_res[:,1]), max(k_res[:,0])+max(k_res[:,1]))
-        plt.show()
-
-    def decode_poisson_hmm(self, trials_to_use=None, file_name=None, cells_to_use="all"):
-        # --------------------------------------------------------------------------------------------------------------
-        # loads model from file and decodes data
-        #
-        # args:     - nr_modes, int: #clusters to fit to data --> used to identify file that fits the data
-        #           - file_name, string:    is used if model from a different experiment phase is supposed to be used
-        #                                   (e.g. model from awake is supposed to be fit to sleep data)
-        # --------------------------------------------------------------------------------------------------------------
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-        if trials_to_use is "all":
-            trials_to_use = range(self.nr_trials)
-
-
-        # check how many cells
-        nr_cells = self.trial_raster_list[0].shape[0]
-        raster = np.empty((nr_cells, 0))
-        for trial_id in trials_to_use:
-            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
-        nr_time_bins = raster.shape[1]
-
-        if file_name is None:
-            file_name = self.default_phmm
-        if cells_to_use == "all":
-            with open(self.params.pre_proc_dir+"phmm/"+file_name+".pkl", "rb") as file:
-                model = pickle.load(file)
-        elif cells_to_use == "stable":
-            with open(self.params.pre_proc_dir+"phmm/stable_cells/"+file_name+".pkl", "rb") as file:
-                model = pickle.load(file)
-            with open(self.params.pre_proc_dir + "cell_classification/" +
-                      self.session_name + "_" + self.params.stable_cell_method + ".pickle",
-                      "rb") as f:
-                class_dic = pickle.load(f)
-            raster = raster[class_dic["stable_cell_ids"], :]
-
-        elif cells_to_use == "decreasing":
-            with open(self.params.pre_proc_dir+"phmm/decreasing_cells/"+file_name+".pkl", "rb") as file:
-                model = pickle.load(file)
-            with open(self.params.pre_proc_dir + "cell_classification/" +
-                      self.session_name + "_" + self.params.stable_cell_method + ".pickle",
-                      "rb") as f:
-                class_dic = pickle.load(f)
-            raster = raster[class_dic["decrease_cell_ids"], :]
-
-        nr_modes_ = model.means_.shape[0]
-
-        # compute most likely sequence
-        sequence = model.predict(raster.T)
-        post_prob = model.predict_proba(raster.T)
-        return sequence, nr_modes_, post_prob
-
-    def load_poisson_hmm(self, trials_to_use=None, nr_modes=None, file_name=None, cells_to_use="all_cells"):
-        # --------------------------------------------------------------------------------------------------------------
-        # loads model from file and returns model
-        #
-        # args:     - nr_modes, int: #clusters to fit to data --> used to identify file that fits the data
-        #           - file_name, string:    is used if model from a different experiment phase is supposed to be used
-        #                                   (e.g. model from awake is supposed to be fit to sleep data)
-        # --------------------------------------------------------------------------------------------------------------
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        if (nr_modes is None) & (file_name is None):
-            raise Exception("PROVIDE NR. MODES OR FILE NAME")
-
-        if file_name is None:
-            file_name = self.params.session_name + "_" + str(
-                int(self.params.experiment_phase_id[0])) + "_" + self.cell_type + "_trials_" + str(trials_to_use[0]) + \
-                        "_" + str(trials_to_use[-1]) + "_" + str(nr_modes) + "_modes"
-        else:
-            file_name =file_name
-
-        if cells_to_use == "stable_cells":
-            save_dir = self.params.pre_proc_dir+"phmm/stable_cells"
-        elif cells_to_use == "decreasing_cells":
-            save_dir = self.params.pre_proc_dir+"phmm/decreasing_cells"
-        elif cells_to_use == "all_cells":
-            save_dir = self.params.pre_proc_dir+"phmm/"
-
-        with open(save_dir+file_name+".pkl", "rb") as file:
-            model = pickle.load(file)
-
-        return model
-
-    def fit_spatial_gaussians_for_modes(self, nr_modes=None, file_name=None, trials_to_use=None,
-                                        min_nr_bins_active=5, plot_awake_fit=False, plot_modes=False):
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        # get location data from trials
-        nr_cells = self.trial_raster_list[0].shape[0]
-        loc = np.empty((0,2))
-        raster = np.empty((nr_cells, 0))
-        for trial_id in trials_to_use:
-            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
-            loc = np.vstack((loc, self.trial_loc_list[trial_id]))
-
-        state_sequence, nr_modes, _ = self.decode_poisson_hmm(file_name=file_name,
-                                                           trials_to_use=trials_to_use)
-
-        mode_id, freq = np.unique(state_sequence, return_counts=True)
-        modes_to_plot = mode_id[freq > min_nr_bins_active]
-
-        cmap = generate_colormap(nr_modes)
-        if plot_modes:
-            fig = plt.figure()
-            ax = fig.add_subplot(111)
-            for mode in np.arange(nr_modes):
-                mode_data = loc[state_sequence == mode, :]
-                # rgb = (random.random(), random.random(), random.random())
-                ax.scatter(mode_data[:, 0], mode_data[:, 1],
-                           alpha=1, marker=".", s=1, label="DIFFERENT MODES", c=np.array([cmap(mode)]))
-
-            ax.set_ylim(self.y_min, self.y_max)
-            ax.set_xlim(self.x_min, self.x_max)
-            for g_l in self.goal_locations:
-                ax.scatter(g_l[0], g_l[1], color="w", label="GOALS")
-
-            plt.gca().set_aspect('equal', adjustable='box')
-            handles, labels = ax.get_legend_handles_labels()
-            by_label = OrderedDict(zip(labels, handles))
-            ax.legend(by_label.values(), by_label.keys())
-            plt.title("MODE ASSIGNMENT AWAKE DATA")
-            plt.xlabel("X")
-            plt.ylabel("Y")
-            plt.show()
-
-            for mode in np.arange(nr_modes):
-                mode_data = loc[state_sequence == mode, :]
-                fig, ax = plt.subplots()
-                ax.scatter(loc[:,0], loc[:,1], color="grey", s=1, label="TRACKING")
-                ax.scatter(mode_data[:, 0], mode_data[:, 1],
-                       alpha=1, marker=".", s=1, label="MODE " + str(mode) + " ASSIGNED",
-                           color="red")
-                for g_l in self.goal_locations:
-                    ax.scatter(g_l[0], g_l[1], color="w", label="GOALS")
-                ax.set_ylim(self.y_min, self.y_max)
-                ax.set_xlim(self.x_min, self.x_max)
-                plt.xlabel("X")
-                plt.ylabel("Y")
-                plt.gca().set_aspect('equal', adjustable='box')
-                handles, labels = ax.get_legend_handles_labels()
-                by_label = OrderedDict(zip(labels, handles))
-                ax.legend(by_label.values(), by_label.keys())
-                plt.show()
-
-        means = np.zeros((2, nr_modes))
-        cov = np.zeros((2, nr_modes))
-        for mode in np.arange(nr_modes):
-            mode_data = loc[state_sequence == mode, :]
-
-            if len(mode_data) == 0:
-                means[:, mode] = np.nan
-                cov[:, mode] = np.nan
-            else:
-                means[:, mode] = np.mean(mode_data, axis=0)
-                cov[:, mode] = np.var(mode_data, axis=0)
-
-        loc_data = loc[:, :]
-
-        center = np.min(loc_data, axis=0) + (np.max(loc_data, axis=0) - np.min(loc_data, axis=0)) * 0.5
-        dist = loc_data - center
-
-        rad = max(np.sqrt(np.square(dist[:, 0]) + np.square(dist[:, 1]))) + 1
-
-        std_modes = np.sqrt(cov[0,:]+cov[1,:])
-        std_modes[std_modes == 0] = np.nan
-
-        if plot_awake_fit:
-
-            for mode_to_plot in modes_to_plot:
-
-                mean = means[:, mode_to_plot]
-                cov_ = cov[:, mode_to_plot]
-                std_ = std_modes[mode_to_plot]
-
-                # Parameters to set
-                mu_x = mean[0]
-                variance_x = cov_[0]
-
-                mu_y = mean[1]
-                variance_y = cov_[1]
-
-                # Create grid and multivariate normal
-                x = np.linspace(center[0] - rad, center[0]+rad, int(2.2*rad))
-                y = np.linspace(0, 250, 250)
-                X, Y = np.meshgrid(x, y)
-                pos = np.empty(X.shape + (2,))
-                pos[:, :, 0] = X
-                pos[:, :, 1] = Y
-                rv = multivariate_normal([mu_x, mu_y], [[variance_x, 0], [0, variance_y]])
-                rv_normalized = rv.pdf(pos) / np.sum(rv.pdf(pos).flatten())
-
-                fig, ax = plt.subplots()
-                gauss = ax.imshow(rv_normalized)
-                env = Circle((center[0], center[1]), rad, color="white", fill=False)
-                ax.add_artist(env)
-                ax.set_ylim(center[1] - 1.1*rad, center[1]+1.1*rad)
-                ax.scatter(loc_data[state_sequence == mode_to_plot, 0], loc_data[state_sequence == mode_to_plot, 1],
-                           alpha=1, c="white", marker=".", s=0.3, label="MODE "+ str(mode_to_plot) +" ASSIGNED")
-                cb = plt.colorbar(gauss)
-                cb.set_label("PROBABILITY")
-                plt.xlabel("X")
-                plt.ylabel("Y")
-                plt.title("STD: "+str(np.round(std_, 2)))
-                plt.legend()
-                plt.show()
-
-        # compute frequency of each mode
-        mode_freq = np.zeros(nr_modes)
-        mode_freq[mode_id] = freq
-        mode_freq = mode_freq.astype(int)
-
-        env = Circle((center[0], center[1]), rad, color="white", fill=False)
-
-        result_dic = {
-            "std_modes": std_modes
-        }
-
-        with open("temp_data/test1", "wb") as f:
-            pickle.dump(result_dic, f)
-
-
-        return means, std_modes, mode_freq, env, state_sequence
-
-    def plot_all_phmm_modes_spatial(self, nr_modes):
-        for i in range(nr_modes):
-            self.plot_phmm_mode_spatial(mode_id = i)
-
-    def plot_phmm_mode_spatial(self, mode_id, ax=None, save_fig=False, use_viterbi=True, cells_to_use="all"):
-        plt.style.use('default')
-        if ax is None:
-            fig = plt.figure()
-            ax = fig.add_subplot(111)
-
-        trials_to_use = self.default_trials
-
-        # get location data from trials
-        nr_cells = self.trial_raster_list[0].shape[0]
-        loc = np.empty((0,2))
-        raster = np.empty((nr_cells, 0))
-        for trial_id in trials_to_use:
-            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
-            loc = np.vstack((loc, self.trial_loc_list[trial_id]))
-
-        # plot all tracking data
-        ax.scatter(loc[:,0], loc[:,1], color="lightgray", s=1, label="Tracking")
-
-        if use_viterbi:
-            if cells_to_use == "all":
-                file_name = self.default_phmm
-            elif cells_to_use == "stable":
-                file_name = self.default_phmm_stable
-            state_sequence, nr_modes, _ = self.decode_poisson_hmm(file_name=file_name,
-                                                               trials_to_use=trials_to_use, cells_to_use=cells_to_use)
-        else:
-            cells_to_use = "stable"
-            # load phmm model
-            with open(self.params.pre_proc_dir + "phmm/" + self.default_phmm + '.pkl', 'rb') as f:
-                model_dic = pickle.load(f)
-            # get means of model (lambdas) for decoding
-            mode_means = model_dic.means_
-            cell_selection = "custom"
-            with open(self.params.pre_proc_dir + "cell_classification/" +
-                      self.session_name + "_" + self.params.stable_cell_method + ".pickle", "rb") as f:
-                class_dic = pickle.load(f)
-
-            if cells_to_use == "stable":
-                cell_ids = class_dic["stable_cell_ids"]
-            results_list = decode_using_phmm_modes(mode_means=mode_means, event_spike_rasters=[raster],
-                                                   compression_factor=1, cells_to_use=cell_ids,
-                                                   cell_selection=cell_selection)
-            likelihoods = results_list[0]
-            state_sequence = np.argmax(likelihoods, axis=1)
-
-        for g_l in self.goal_locations:
-            ax.scatter(g_l[0], g_l[1], color="black", label="Goal locations")
-
-        mode_data = loc[state_sequence == mode_id, :]
-        ax.scatter(mode_data[:, 0], mode_data[:, 1],
-                   alpha=1, marker=".", s=1, color="red")
-        # ax.set_ylim(30, 230)
-        # ax.set_xlim(70, 300)
-        #ax.set_xlim(self.x_min, self.x_max)
-        plt.xlabel("X (cm)")
-        plt.ylabel("Y (cm)")
-        plt.gca().set_aspect('equal', adjustable='box')
-        handles, labels = ax.get_legend_handles_labels()
-        by_label = OrderedDict(zip(labels, handles))
-        ax.legend(by_label.values(), by_label.keys())
-        plt.title("State " + str(mode_id))
-        if save_fig:
-            plt.savefig("state_"+str(mode_id)+".svg", transparent="True")
-            plt.rcParams['svg.fonttype'] = 'none'
-        else:
-            plt.show()
-
-    def plot_phmm_state_neural_patterns(self, nr_modes):
-
-        trials_to_use = self.default_trials
-
-        file_name = self.params.session_name + "_" + str(
-            int(self.params.experiment_phase_id[0])) + "_" + self.cell_type + "_trials_"+str(trials_to_use[0])+\
-                      "_"+str(trials_to_use[-1])+"_"+str(nr_modes)+"_modes"
-
-        with open(self.params.pre_proc_dir+"phmm/" + file_name + ".pkl", "rb") as file:
-            model = pickle.load(file)
-
-        # get means
-        means = model.means_
-
-        x_max_ = np.max(means.flatten())
-        x_min_ = np.min(means.flatten())
-
-        n_col = 10
-        scaler = 0.1
-        plt.style.use('default')
-        fig = plt.figure(figsize=(8,6))
-        gs = fig.add_gridspec(6, n_col)
-
-        ax1 = fig.add_subplot(gs[:, 0])
-        ax1.imshow(np.expand_dims(means[0, :], 1))
-        ax1.set_xticks([])
-        ax1.set_xlabel(str(0))
-        ax1.set_aspect(scaler)
-        ax1.set_ylabel("CELL ID")
-
-        for i in range(1, n_col-1):
-            ax1 = fig.add_subplot(gs[:, i])
-            a = ax1.imshow(np.expand_dims(means[i,:], 1))
-            ax1.set_xticks([])
-            ax1.set_yticks([], [])
-            ax1.set_xlabel(str(i))
-            ax1.set_aspect(scaler)
-
-        plt.tight_layout()
-        ax1 = fig.add_subplot(gs[:, n_col-1])
-        fig.colorbar(a, cax=ax1)
-        plt.rcParams['svg.fonttype'] = 'none'
-        #plt.show()
-        plt.savefig("state_neural_pattern.svg", transparent="True")
-
-        print("HERE")
-
     def analyze_modes_goal_coding(self, file_name, mode_ids, thr_close_to_goal=25, plotting=False):
 
         trials_to_use = self.default_trials
@@ -10754,1122 +11895,9 @@ class Cheeseboard:
 
         return frac_close_to_goal
 
-    def analyze_modes_spatial_information(self, file_name, mode_ids, plotting=True):
-
-        trials_to_use = self.default_trials
-
-        # get location data from trials
-        nr_cells = self.trial_raster_list[0].shape[0]
-        loc = np.empty((0,2))
-        raster = np.empty((nr_cells, 0))
-        for trial_id in trials_to_use:
-            raster = np.hstack((raster, self.trial_raster_list[trial_id]))
-            loc = np.vstack((loc, self.trial_loc_list[trial_id]))
-
-        state_sequence, nr_modes_, _ = self.decode_poisson_hmm(file_name=file_name,
-                                                           trials_to_use=trials_to_use)
-
-        _, loc_data, _ = self.get_raster_location_speed()
-
-        # only use data from mode ids provided
-        # all_modes_data = loc_data[np.isin(state_sequence, mode_ids), :]
-        # pd_all_modes = upper_tri_without_diag(pairwise_distances(all_modes_data))
-        # all_modes_med_dist = np.median(pd_all_modes)
-
-        med_dist_list = []
-
-        for mode in mode_ids:
-            mode_loc = loc_data[state_sequence == mode, :]
-
-            # compute pairwise distances (euclidean)
-            pd = upper_tri_without_diag(pairwise_distances(mode_loc))
-
-            med_dist = np.median(pd)
-            # std_dist = np.std(np.array(dist_list))
-            med_dist_list.append(med_dist)
-
-            if plotting:
-
-                fig, ax = plt.subplots()
-                ax.scatter(loc_data[:,0], loc_data[:,1], color="gray", s=1, label="TRACKING")
-                ax.scatter(mode_loc[:, 0], mode_loc[:, 1], color="red", label="MODE "+str(mode)+" ASSIGNED", s=1)
-                plt.xlabel("X")
-                plt.ylabel("Y")
-                plt.title("MODE "+str(mode)+"\nMEDIAN DISTANCE: "+ str(np.round(med_dist,2)))
-                plt.legend()
-                plt.show()
-
-        return np.mean(np.array(med_dist_list))
-
-    def phmm_mode_spatial_information_from_model(self, spatial_resolution=1, file_name=None,
-                                            plot_for_control=False):
-        """
-        loads poisson hmm model and weighs rate maps by lambda vectors --> then computes spatial information (sparsity,
-        skaggs information)
-
-        @param spatial_resolution: spatial resolution in cm
-        @type spatial_resolution: int
-        @param nr_modes: nr of modes for model file identification
-        @type nr_modes: int
-        @param file_name: file containing the model --> is used when nr_modes is not provided to identify file
-        @type file_name: string
-        @param plot_for_control: whether to plot intermediate results
-        @type plot_for_control: bool
-        @return: sparsity, skaggs info for each mode
-        """
-
-        print(" - SPATIAL INFORMATION OF PHMM MODES USING MODEL\n")
-
-        if file_name is None:
-            file_name = self.default_phmm
-
-        with open(self.params.pre_proc_dir+"phmm/"+file_name+".pkl", "rb") as file:
-            model = pickle.load(file)
-
-        # get means for all modes (lambda vectors)
-        means = model.means_
-
-        ################################################################################################################
-        # get spatial information of mode by weighing rate maps
-        ################################################################################################################
-
-        # compute rate maps and occupancy
-        rate_maps = self.get_rate_maps(spatial_resolution=spatial_resolution, trials_to_use=None)
-        occ = self.get_occ_map(spatial_resolution=spatial_resolution, trials_to_use=None)
-        prob_occ = occ / occ.sum()
-        # compute binary occupancy map --> used as a mask to filter non-visited bins
-        occ_mask = np.where(occ > 0, 1, np.nan)
-        prob_occ_orig = np.multiply(prob_occ, occ_mask)
-
-        sparsity_list = []
-        skaggs_per_second_list = []
-        skaggs_per_spike_list = []
-
-        # go through all modes
-        for mode_id, means_mode in enumerate(means):
-            # weigh rate map of each cell using mean firing from lambda vector --> compute mean across all cells
-            rate_map_mode_orig = np.mean(rate_maps * means_mode, axis=2)
-            # generate filtered rate map by masking non visited places
-            rate_map_mode_orig = np.multiply(rate_map_mode_orig, occ_mask)
-
-            rate_map_mode = rate_map_mode_orig[~np.isnan(rate_map_mode_orig)]
-            prob_occ = prob_occ_orig[~np.isnan(prob_occ_orig)]
-
-            # need to filter bins with zero firing rate --> otherwise log causes an error
-            rate_map_mode = rate_map_mode[rate_map_mode > 0]
-            prob_occ = prob_occ[rate_map_mode > 0]
-
-            # compute sparsity
-            sparse_mode = (np.sum(prob_occ * rate_map_mode) ** 2) / np.sum(prob_occ * (rate_map_mode ** 2))
-
-            # find good bins so that there is no problem with the log
-            good_bins = (rate_map_mode / rate_map_mode.mean() > 0.0000001)
-            mean_rate = np.sum(rate_map_mode[good_bins] * prob_occ[good_bins])
-            skaggs_info_per_sec = np.sum(rate_map_mode[good_bins] * prob_occ[good_bins] *
-                                         np.log(rate_map_mode[good_bins] / mean_rate))
-            skaggs_info_per_spike = np.sum(rate_map_mode[good_bins] / mean_rate * prob_occ[good_bins] *
-                                           np.log(rate_map_mode[good_bins] / mean_rate))
-
-            skaggs_per_second_list.append(skaggs_info_per_sec)
-            skaggs_per_spike_list.append(skaggs_info_per_spike)
-            sparsity_list.append(sparse_mode)
-            if plot_for_control:
-                # plot random examples
-                rand_float = np.random.randn(1)
-                if rand_float > 0.5:
-                    plt.imshow(rate_map_mode_orig)
-                    plt.colorbar()
-                    plt.title("Sparsity: "+str(sparse_mode)+"\n Skaggs per second: "+str(skaggs_info_per_sec)+
-                              "\n Skaggs per spike: "+ str(skaggs_info_per_spike))
-                    plt.show()
-
-        if plot_for_control:
-            plt.hist(skaggs_per_second_list)
-            plt.title("SKAGGS INFO (PER SECOND)")
-            plt.xlabel("SKAGGS INFO.")
-            plt.ylabel("COUNTS")
-            plt.show()
-
-            plt.hist(skaggs_per_spike_list)
-            plt.title("SKAGGS INFO (PER SPIKE)")
-            plt.xlabel("SKAGGS INFO.")
-            plt.ylabel("COUNTS")
-            plt.show()
-
-            plt.hist(sparsity_list)
-            plt.title("SPARSITY")
-            plt.xlabel("SPARSITY")
-            plt.ylabel("COUNTS")
-            plt.show()
-
-            plt.scatter(skaggs_per_second_list, sparsity_list)
-            plt.title("SKAGGS (PER SEC) vs. SPARSITY\n"+str(pearsonr(skaggs_per_second_list, sparsity_list)))
-            plt.xlabel("SKAGGS (PER SEC)")
-            plt.ylabel("SPARSITY")
-            plt.show()
-
-            plt.scatter(skaggs_per_spike_list, sparsity_list)
-            plt.title("SKAGGS (PER SPIKE) vs. SPARSITY\n"+str(pearsonr(skaggs_per_spike_list, sparsity_list)))
-            plt.xlabel("SKAGGS (PER SPIKE)")
-            plt.ylabel("SPARSITY")
-            plt.show()
-
-            plt.scatter(skaggs_per_second_list, skaggs_per_spike_list)
-            plt.title("SKAGGS (PER SEC) vs. SKAGGS (PER SPIKE)\n"+str(pearsonr(skaggs_per_second_list, skaggs_per_spike_list)))
-            plt.xlabel("SKAGGS (PER SEC)")
-            plt.ylabel("SKAGGS (PER SPIKE)")
-            plt.show()
-
-        return np.array(sparsity_list), np.array(skaggs_per_second_list), np.array(skaggs_per_spike_list)
-
-    def nr_spikes_per_mode(self, trials_to_use=None, nr_modes=None):
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        model = self.load_poisson_hmm(trials_to_use, nr_modes)
-        means = model.means_
-
-        spikes_per_mode = np.sum(means, axis=1)
-        y,_,_ = plt.hist(spikes_per_mode, bins=50)
-        plt.vlines(np.mean(spikes_per_mode), 0, y.max(), colors="r",
-                   label="MEAN: "+str(np.round(np.mean(spikes_per_mode),2)))
-        plt.vlines(np.median(spikes_per_mode), 0, y.max(), colors="blue",
-                   label="MEDIAN: "+str(np.median(spikes_per_mode)))
-        plt.legend()
-        plt.title("#SPIKES PER MODE")
-        plt.xlabel("AVG. #SPIKES PER MODE")
-        plt.ylabel("COUNT")
-        plt.show()
-
-    def decode_awake_activity_spike_binning(self, model_name=None, trials_to_use=None, plot_for_control=False,
-                                   return_results=True, cells_to_use="all"):
-        """
-        decodes sleep activity using pHMM modes/spatial bins from ising model from before and after awake activity and
-        computes similarity measure
-
-        @param model_name: name of file containing the pHMM file
-        @type model_name: str
-        @param plot_for_control: plots intermediate results if True
-        @type plot_for_control: bool
-        @param return_results: whether to return results or not
-        @type return_results: bool
-        @return: pre_prob (probabilities of PRE), post_prob (probabilities of ), event_times (in sec),
-        swr_in_which_n_rem (assignement SWR - nrem phase)
-        @rtype: list, list, list, numpy.array
-        """
-
-        print(" - AWAKE DECODING USING PHMM MODES ...\n")
-        result_dir = "phmm_decoding"
-        # get template file name from parameter file of session if not provided
-        if model_name is None:
-            model_name = self.session_params.default_pre_phmm_model
-
-        if model_name is None:
-            raise Exception("MODEL FILE NOT FOUND\n NOR IN SESSION PARAMETER FILE DEFINED")
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        print("   --> USING TRIALS: "+str(trials_to_use[0])+"-"+str(trials_to_use[-1])+"\n")
-
-        # check that template files are from correct session
-        # --------------------------------------------------------------------------------------------------------------
-
-        file_name = self.session_name +"_"+self.experiment_phase_id +\
-                        "_"+ self.cell_type+"_AWAKE_DEC_"+cells_to_use+".npy"
-
-        # check if PRE and POST result exists already
-        # --------------------------------------------------------------------------------------------------------------
-        if os.path.isfile(self.params.pre_proc_dir + result_dir + "/" + file_name):
-            print(" - RESULTS EXIST ALREADY -- USING EXISTING RESULTS\n")
-        else:
-            # if results don't exist --> compute results
-            # go trough all trials and compute constant #spike bins
-            spike_rasters = []
-
-            for trial_id in trials_to_use:
-                key = "trial"+str(trial_id)
-                # compute spike rasters --> time stamps here are at .whl resolution (20kHz/512 --> 0.0256s)
-                spike_raster = PreProcessAwake(
-                    firing_times=self.data_dic["trial_data"][key]["spike_times"][self.cell_type],
-                    params=self.params, whl=self.data_dic["trial_data"][key]["whl"],
-                    ).spike_binning()
-
-                if plot_for_control:
-                    if random.uniform(0, 1) > 0.5:
-                        plt.imshow(spike_raster, interpolation='nearest', aspect='auto')
-                        plt.title("TRIAL"+str(trial_id)+": CONST. #SPIKES BINNING, 12 SPIKES PER BIN")
-                        plt.xlabel("BIN ID")
-                        a = plt.colorbar()
-                        a.set_label("#SPIKES")
-                        plt.ylabel("CELL ID")
-                        plt.show()
-
-                        plt.imshow(self.trial_raster_list[trial_id], interpolation='nearest', aspect='auto')
-                        plt.title("TIME BINNING, 100ms TIME BINS")
-                        plt.xlabel("TIME BIN ID")
-                        plt.ylabel("CELL ID")
-                        a = plt.colorbar()
-                        a.set_label("#SPIKES")
-                        plt.show()
-
-                spike_rasters.append(spike_raster)
-
-            # load phmm model
-            with open(self.params.pre_proc_dir + "phmm/" + model_name + '.pkl', 'rb') as f:
-                model_dic = pickle.load(f)
-            # get means of model (lambdas) for decoding
-            mode_means = model_dic.means_
-
-            time_bin_size_encoding = model_dic.time_bin_size
-
-            # check if const. #spike bins are correct for the loaded compression factor
-            if not self.params.spikes_per_bin == 12:
-                raise Exception("TRYING TO LOAD COMPRESSION FACTOR FOR 12 SPIKES PER BIN, "
-                                "BUT CURRENT #SPIKES PER BIN != 12")
-
-            # load correct compression factor (as defined in parameter file of the session)
-            if time_bin_size_encoding == 0.01:
-                compression_factor = \
-                    np.round(self.session_params.sleep_compression_factor_12spikes_100ms * 10, 3)
-            elif time_bin_size_encoding == 0.1:
-                compression_factor = self.session_params.sleep_compression_factor_12spikes_100ms
-            else:
-                raise Exception("COMPRESSION FACTOR NEITHER PROVIDED NOR FOUND IN PARAMETER FILE")
-
-            if cells_to_use == "all":
-                cell_selection = "all"
-                cell_ids = np.empty(0)
-
-            else:
-
-                cell_selection = "custom"
-                with open(self.params.pre_proc_dir + "cell_classification/" +
-                          self.session_name +"_"+ self.params.stable_cell_method +".pickle","rb") as f:
-                    class_dic = pickle.load(f)
-
-                if cells_to_use == "stable":
-                    cell_ids = class_dic["stable_cell_ids"]
-                elif cells_to_use == "increasing":
-                    cell_ids = class_dic["increase_cell_ids"]
-                elif cells_to_use == "decreasing":
-                    cell_ids = class_dic["decrease_cell_ids"]
-
-            print(" - DECODING USING " + cells_to_use + " CELLS")
-
-            # decode activity
-            results_list = decode_using_phmm_modes(mode_means=mode_means, event_spike_rasters=spike_rasters,
-                                                   compression_factor=compression_factor, cells_to_use=cell_ids,
-                                                   cell_selection=cell_selection)
-
-            # plot maps of some SWR for control
-            if plot_for_control:
-                for trial_id, res in zip(trials_to_use, results_list):
-                    plt.imshow(np.log(res.T), interpolation='nearest', aspect='auto')
-                    plt.xlabel("POP.VEC. ID")
-                    plt.ylabel("MODE ID")
-                    a = plt.colorbar()
-                    a.set_label("LOG-PROBABILITY")
-                    plt.title("LOG-PROBABILITY MAP: TRIAL "+str(trial_id))
-                    plt.show()
-
-            # saving results
-            # --------------------------------------------------------------------------------------------------
-            # create dictionary with results
-            result_post = {
-                "results_list": results_list,
-            }
-            outfile = open(self.params.pre_proc_dir + result_dir +"/" + file_name, 'wb')
-            pickle.dump(result_post, outfile)
-            print("  - SAVED NEW RESULTS!\n")
-
-        if return_results:
-
-            # load decoded maps
-            result_pre = pickle.load(open(self.params.pre_proc_dir+result_dir + "/" + file_name, "rb"))
-
-            pre_prob = result_pre["results_list"]
-
-            return pre_prob
-
-    def decode_awake_activity_time_binning(self, model_name=None, trials_to_use=None, plot_for_control=False,
-                                   return_results=True, cells_to_use="all"):
-        """
-        decodes sleep activity using pHMM modes/spatial bins from ising model from before and after awake activity and
-        computes similarity measure
-
-        @param model_name: name of file containing the pHMM file
-        @type model_name: str
-        @param plot_for_control: plots intermediate results if True
-        @type plot_for_control: bool
-        @param return_results: whether to return results or not
-        @type return_results: bool
-        @return: pre_prob (probabilities of PRE), post_prob (probabilities of ), event_times (in sec),
-        swr_in_which_n_rem (assignement SWR - nrem phase)
-        @rtype: list, list, list, numpy.array
-        """
-
-        print(" - AWAKE DECODING USING PHMM MODES ...\n")
-        result_dir = "phmm_decoding"
-        # get template file name from parameter file of session if not provided
-        if model_name is None:
-            model_name = self.session_params.default_phmm_model
-
-        if model_name is None:
-            raise Exception("MODEL FILE NOT FOUND\n NOR IN SESSION PARAMETER FILE DEFINED")
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        print("   --> USING TRIALS: "+str(trials_to_use[0])+"-"+str(trials_to_use[-1])+"\n")
-
-        # check that template files are from correct session
-        # --------------------------------------------------------------------------------------------------------------
-
-        file_name = self.session_name +"_"+self.experiment_phase_id +\
-                        "_"+ self.cell_type+"_AWAKE_DEC_"+cells_to_use+"_time_binning"+".npy"
-
-        # check if PRE and POST result exists already
-        # --------------------------------------------------------------------------------------------------------------
-        if os.path.isfile(self.params.pre_proc_dir + result_dir + "/" + file_name):
-            print(" - RESULTS EXIST ALREADY -- USING EXISTING RESULTS\n")
-        else:
-            # if results don't exist --> compute results
-            # go trough all trials and compute constant #spike bins
-            spike_rasters = []
-
-            for trial_id in trials_to_use:
-                key = "trial"+str(trial_id)
-                # compute spike rasters --> time stamps here are at .whl resolution (20kHz/512 --> 0.0256s)
-                spike_raster= PreProcessAwake(
-                    firing_times=self.data_dic["trial_data"][key]["spike_times"][self.cell_type],
-                    params=self.params, whl=self.data_dic["trial_data"][key]["whl"],
-                    ).interval_temporal_binning(interval_start=self.data_dic["trial_timestamps"][0, trial_id],
-                                                interval_end=self.data_dic["trial_timestamps"][1, trial_id],
-                                                interval_freq=0.0256)
-
-                if plot_for_control:
-                    if random.uniform(0, 1) > 0.5:
-                        plt.imshow(spike_raster, interpolation='nearest', aspect='auto')
-                        plt.title("TRIAL"+str(trial_id)+": CONST. #SPIKES BINNING, 12 SPIKES PER BIN")
-                        plt.xlabel("BIN ID")
-                        a = plt.colorbar()
-                        a.set_label("#SPIKES")
-                        plt.ylabel("CELL ID")
-                        plt.show()
-
-                        plt.imshow(self.trial_raster_list[trial_id], interpolation='nearest', aspect='auto')
-                        plt.title("TIME BINNING, 100ms TIME BINS")
-                        plt.xlabel("TIME BIN ID")
-                        plt.ylabel("CELL ID")
-                        a = plt.colorbar()
-                        a.set_label("#SPIKES")
-                        plt.show()
-
-                spike_rasters.append(spike_raster)
-
-            # load phmm model
-            with open(self.params.pre_proc_dir + "phmm/" + model_name + '.pkl', 'rb') as f:
-                model_dic = pickle.load(f)
-            # get means of model (lambdas) for decoding
-            mode_means = model_dic.means_
-
-            time_bin_size_encoding = model_dic.time_bin_size
-
-            if not time_bin_size_encoding == self.params.time_bin_size:
-                raise Exception("Time bin size of model and data are not matching!")
-
-            if cells_to_use == "all":
-                cell_selection = "all"
-                cell_ids = np.empty(0)
-
-            else:
-
-                cell_selection = "custom"
-                with open(self.params.pre_proc_dir + "cell_classification/" +
-                          self.session_name +"_"+ self.params.stable_cell_method +".pickle","rb") as f:
-                    class_dic = pickle.load(f)
-
-                if cells_to_use == "stable":
-                    cell_ids = class_dic["stable_cell_ids"]
-                elif cells_to_use == "increasing":
-                    cell_ids = class_dic["increase_cell_ids"]
-                elif cells_to_use == "decreasing":
-                    cell_ids = class_dic["decrease_cell_ids"]
-
-            print(" - DECODING USING " + cells_to_use + " CELLS")
-
-            # decode activity
-            results_list = decode_using_phmm_modes(mode_means=mode_means, event_spike_rasters=spike_rasters,
-                                                   compression_factor=1, cells_to_use=cell_ids,
-                                                   cell_selection=cell_selection)
-
-            # plot maps of some SWR for control
-            if plot_for_control:
-                for trial_id, res in zip(trials_to_use, results_list):
-                    plt.imshow(np.log(res.T), interpolation='nearest', aspect='auto')
-                    plt.xlabel("POP.VEC. ID")
-                    plt.ylabel("MODE ID")
-                    a = plt.colorbar()
-                    a.set_label("LOG-PROBABILITY")
-                    plt.title("LOG-PROBABILITY MAP: TRIAL "+str(trial_id))
-                    plt.show()
-
-            # saving results
-            # --------------------------------------------------------------------------------------------------
-            # create dictionary with results
-            result_post = {
-                "results_list": results_list,
-            }
-            outfile = open(self.params.pre_proc_dir + result_dir +"/" + file_name, 'wb')
-            pickle.dump(result_post, outfile)
-            print("  - SAVED NEW RESULTS!\n")
-
-        if return_results:
-
-            # load decoded maps
-            result_pre = pickle.load(open(self.params.pre_proc_dir+result_dir + "/" + file_name, "rb"))
-
-            pre_prob = result_pre["results_list"]
-
-            return pre_prob
-
-    def decode_awake_activity_visualization(self, cells_to_use="all", binning="spike_binning"):
-
-        if binning == "spike_binning":
-            results = self.decode_awake_activity_spike_binning(cells_to_use=cells_to_use)
-        elif binning == "time_binning":
-            results = self.decode_awake_activity_time_binning(cells_to_use=cells_to_use)
-
-        a = np.vstack(results)
-        b = np.argmax(a, axis=1)
-
-        mode_ids, nr_counts = np.unique(b, return_counts=True)
-
-
-        fig, ax = plt.subplots()
-
-        lines = []
-        for i in range(mode_ids.shape[0]):
-            pair = [(mode_ids[i], 0), (mode_ids[i], nr_counts[i])]
-            lines.append(pair)
-
-        linecoll = matcoll.LineCollection(lines, colors="lightskyblue")
-
-        ax.add_collection(linecoll)
-        plt.scatter(mode_ids, nr_counts)
-        plt.xlabel("Mode ID")
-        plt.ylabel("Times assigned")
-        plt.title("Awake decoding - "+cells_to_use)
-        plt.show()
-
-        exit()
-
-        sep_array = np.cumsum(np.array([x.shape[0] for x in results]))
-        labels = [str(x) for x in self.params.default_trials]
-
-        results = np.log(np.vstack(results).T)
-
-        rd = multi_dim_scaling(act_mat=results, param_dic=self.params)
-
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        plot_2D_scatter(ax=ax, mds=rd, data_sep=sep_array, labels=labels, params=self.params)
-        handles, labels = ax.get_legend_handles_labels()
-        by_label = OrderedDict(zip(labels, handles))
-        ax.legend(by_label.values(), by_label.keys())
-        plt.show()
-
-    def decode_awake_activity_autocorrelation_spikes_likelihood_vectors(self, plot_for_control=True, plotting=True,
-                                                                        bootstrapping=False, nr_pop_vecs=10, save_fig=False):
-
-        # get likelihood vectors
-        likeli_vecs_list = self.decode_awake_activity_spike_binning()
-        likeli_vecs = np.vstack(likeli_vecs_list)
-        # compute correlations
-        shift_array = np.arange(-1*int(nr_pop_vecs),
-                                     int(nr_pop_vecs)+1)
-
-        auto_corr, _ = cross_correlate_matrices(likeli_vecs.T, likeli_vecs.T, shift_array=shift_array)
-
-        # fitting exponential
-        # --------------------------------------------------------------------------------------------------------------
-        # only take positive part (symmetric) & exclude first data point
-        autocorr_test_data = auto_corr[int(auto_corr.shape[0] / 2):][1:]
-
-        def exponential(x, a, k, b):
-            return a * np.exp(x * k) + b
-
-        popt_exponential_awake, pcov_exponential_awake = optimize.curve_fit(exponential, np.arange(autocorr_test_data.shape[0]),
-                                                                        autocorr_test_data, p0=[1, -0.5, 1])
-
-        if plotting or save_fig:
-
-            if save_fig:
-                plt.style.use('default')
-            plt.plot(shift_array, (auto_corr-auto_corr[-1])/(1-auto_corr[-1]), c="y", label="Awake")
-            plt.xlabel("Shift (#spikes)")
-            plt.ylabel("Avg. Pearson correlation of likelihood vectors")
-            plt.legend()
-            # plt.xticks([-100, -75, -50, -25, 0, 25, 50, 75, 100], np.array([-100, -75, -50, -25, 0, 25, 50, 75, 100]) * 12)
-            if save_fig:
-                plt.rcParams['svg.fonttype'] = 'none'
-                plt.savefig("sim_ratio_autocorr_spikes.svg", transparent="True")
-                plt.close()
-            else:
-                print("HERE")
-                plt.show()
-
-        else:
-            auto_corr_norm = (auto_corr-auto_corr[-1])/(1-auto_corr[-1])
-            return auto_corr, auto_corr_norm, popt_exponential_awake[1]
-
-        # nrem_test_data = auto_corr_nrem[int(auto_corr_nrem.shape[0] / 2)+1:]
-        # rem_test_data = auto_corr_rem[int(auto_corr_rem.shape[0] / 2) + 1:]
-        #
-        # def exponential(x, a, k, b):
-        #     return a * np.exp(x * k) + b
-        #
-        # popt_exponential_rem, pcov_exponential_rem = optimize.curve_fit(exponential, np.arange(rem_test_data.shape[0]),
-        #                                                                 rem_test_data, p0=[1, -0.5, 1])
-        # popt_exponential_nrem, pcov_exponential_nrem = optimize.curve_fit(exponential, np.arange(nrem_test_data.shape[0]),
-        #                                                                 nrem_test_data, p0=[1, -0.5, 1])
-        # if plotting or save_fig:
-        #
-        #     if save_fig:
-        #         plt.style.use('default')
-        #     # plot fits
-        #     plt.text(3, 10, "k = " +str(np.round(popt_exponential_rem[1], 2)), c="red" )
-        #     plt.scatter(np.arange(rem_test_data.shape[0]), rem_test_data, c="salmon", label="REM data")
-        #     plt.plot((np.arange(rem_test_data.shape[0]))[1:], exponential((np.arange(rem_test_data.shape[0]))[1:],
-        #                                                             a=popt_exponential_rem[0], k=popt_exponential_rem[1],
-        #                                                             b=popt_exponential_rem[2]), c="red", label="REM fit")
-        #     plt.text(0.05, 5, "k = " +str(np.round(popt_exponential_nrem[1], 2)), c="blue" )
-        #     plt.scatter(np.arange(nrem_test_data.shape[0]), nrem_test_data, c="lightblue", label="NREM data")
-        #     plt.plot((np.arange(nrem_test_data.shape[0]))[1:], exponential((np.arange(nrem_test_data.shape[0]))[1:],
-        #                                                             a=popt_exponential_nrem[0], k=popt_exponential_nrem[1],
-        #                                                             b=popt_exponential_nrem[2]), c="blue", label="NREM fit")
-        #
-        #     plt.legend(loc=2)
-        #     plt.ylabel("Pearson R (z-scored)")
-        #     plt.xlabel("nr. spikes")
-        #     plt.ylim(-3, 18)
-        #     if save_fig:
-        #         plt.rcParams['svg.fonttype'] = 'none'
-        #         plt.savefig("exponential_fit_spikes.svg", transparent="True")
-        #         plt.close()
-        #     else:
-        #         plt.show()
-        #
-        # if bootstrapping:
-        #
-        #     # bootstrapping
-        #     n_boots = 500
-        #     n_samples_perc = 0.8
-        #
-        #     nrem_exp = []
-        #     rem_exp = []
-        #
-        #     for boots_id in range(n_boots):
-        #         per_ind = np.random.permutation(np.arange(rem_test_data.shape[0]))
-        #         sel_ind = per_ind[:int(n_samples_perc*per_ind.shape[0])]
-        #         # select subset
-        #         x_rem = np.arange(nrem_test_data.shape[0])[sel_ind]
-        #         x_nrem = np.arange(nrem_test_data.shape[0])[sel_ind]
-        #         y_rem = rem_test_data[sel_ind]
-        #         y_nrem = nrem_test_data[sel_ind]
-        #         try:
-        #             popt_exponential_rem, _ = optimize.curve_fit(exponential,x_rem, y_rem, p0=[1, -0.5, 1])
-        #             popt_exponential_nrem, _ = optimize.curve_fit(exponential, x_nrem, y_nrem, p0=[1, -0.5, 1])
-        #         except:
-        #             continue
-        #
-        #         rem_exp.append(popt_exponential_rem[1])
-        #         nrem_exp.append(popt_exponential_nrem[1])
-        #
-        #     if plotting:
-        #         plt.hist(rem_exp, label="rem", color="red", bins=10, density=True)
-        #         plt.xlabel("k from exp. function")
-        #         plt.ylabel("density")
-        #         plt.legend()
-        #         plt.show()
-        #         plt.hist(nrem_exp, label="nrem", color="blue", alpha=0.8, bins=10, density=True)
-        #         # plt.xlim(-2,0.1)
-        #         # plt.title("k from exponential fit (bootstrapped)\n"+"Ttest one-sided: p="+\
-        #         #           str(ttest_ind(rem_exp, nrem_exp, alternative="greater")[1]))
-        #         # plt.xscale("log")
-        #         plt.show()
-        #     else:
-        #         return np.median(np.array(rem_exp)), np.median(np.array(nrem_exp))
-        # else:
-        #     return popt_exponential_rem[1], popt_exponential_nrem[1]
-
     """#################################################################################################################
     #  location decoding analysis
     #################################################################################################################"""
-
-    def decode_location_phmm(self, trial_to_decode, model_name=None, trials_to_use=None, save_fig=False):
-        """
-        decodes awake activity using pHMM modes from same experiment phase
-
-        @param trial_to_decode: which trial to decode
-        @type trial_to_decode: int
-        @param model_name: name of file containing the pHMM file
-        @type model_name: str
-        @param plot_for_control: plots intermediate results if True
-        @type plot_for_control: bool
-        @param return_results: whether to return results or not
-        @type return_results: bool
-        @return: pre_prob (probabilities of PRE), post_prob (probabilities of ), event_times (in sec),
-        swr_in_which_n_rem (assignement SWR - nrem phase)
-        @rtype: list, list, list, numpy.array
-        """
-
-        print(" - DECODE LOCATION USING PHMM MODES ...\n")
-        result_dir = "phmm_decoding"
-        # get template file name from parameter file of session if not provided
-        if model_name is None:
-            model_name = self.session_params.default_pre_phmm_model
-
-        if model_name is None:
-            raise Exception("MODEL FILE NOT FOUND\n NOR IN SESSION PARAMETER FILE DEFINED")
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        print("   --> USING TRIALS: "+str(trials_to_use[0])+"-"+str(trials_to_use[-1])+"\n")
-
-        # check that template files are from correct session
-        # --------------------------------------------------------------------------------------------------------------
-        sess_pre = model_name.split(sep="_")[0]+"_"+model_name.split(sep="_")[1]
-
-        if not (sess_pre == self.session_name):
-            raise Exception("TEMPLATE FILE AND CURRENT SESSION DO NOT MATCH!")
-
-        # load goal locations
-        goal_loc = np.loadtxt(self.params.pre_proc_dir+"goal_locations"+"/"+"mjc163R2R_0114_11.gcoords")
-
-        # get spatial information from pHMM model
-        means, _, _, _, _ = self.fit_spatial_gaussians_for_modes(file_name=model_name)
-
-        # get location data and raster from trial
-        raster = self.trial_raster_list[trial_to_decode]
-        loc = self.trial_loc_list[trial_to_decode]
-
-        model = self.load_poisson_hmm(file_name=model_name)
-
-        prob = model.predict_proba(raster.T)
-
-        # decode activity
-        # prob_poiss = decode_using_phmm_modes(mode_means=model.means_,
-        #                                        event_spike_rasters=[raster],
-        #                                        compression_factor=1)[0]
-        #
-        # prob_poiss_norm = prob_poiss / np.sum(prob_poiss, axis=1, keepdims=True)
-        #
-        # plt.imshow(prob_poiss_norm, interpolation='nearest', aspect='auto')
-        # plt.show()
-        # plt.imshow(prob, interpolation='nearest', aspect='auto')
-        # plt.show()
-
-        if save_fig:
-            plt.style.use('default')
-            err = np.zeros(prob.shape[0])
-            fig = plt.figure()
-            ax = fig.add_subplot(111)
-            prev_dec_location = None
-            prev_location = None
-            for i, (current_prob, current_loc) in enumerate(zip(prob, loc)):
-                # compute decoded location using weighted average
-                dec_location = np.average(means, weights=current_prob, axis=1)
-                err[i] = np.linalg.norm(dec_location - current_loc)
-                if i > 1:
-                    # ax.plot([dec_location[0], prev_dec_location[0]], [dec_location[1], prev_dec_location[1]], color="mistyrose",
-                    #         zorder=-1000)
-                    ax.plot([current_loc[0], prev_location[0]], [current_loc[1], prev_location[1]], color="lightgray",
-                            zorder=-1000)
-                ax.scatter(dec_location[0], dec_location[1], color="red", label="Decoded locations")
-                ax.scatter(current_loc[0], current_loc[1], color="lightgray", label="True locations")
-                prev_dec_location = dec_location
-                prev_location = current_loc
-            for g_l in self.goal_locations:
-                ax.scatter(g_l[0], g_l[1], color="black", label="Goals", marker="x")
-            handles, labels = ax.get_legend_handles_labels()
-            by_label = OrderedDict(zip(labels, handles))
-            ax.legend(by_label.values(), by_label.keys())
-            plt.title("Decoding using weighted means")
-            plt.xlabel("X (cm)")
-            plt.ylabel("Y (cm)")
-            plt.ylim(10, 110)
-            plt.xlim(30, 140)
-            plt.rcParams['svg.fonttype'] = 'none'
-            plt.savefig("decoded_locations_phmm.svg", transparent="True")
-            # plt.show()
-            plt.close()
-
-            plt.hist(err, density=True, color="indianred", bins=int(err.shape[0]/5))
-            plt.title("Decoding error")
-            plt.xlabel("Error (cm)")
-            plt.xlim(-5,100)
-            plt.ylabel("Density")
-            plt.rcParams['svg.fonttype'] = 'none'
-            plt.savefig("decoding_error_phmm.svg", transparent="True")
-            # plt.show()
-        else:
-            col_map_red = cm.Reds(np.linspace(0, 1, prob.shape[0]))
-            close_to_goal=np.zeros(prob.shape[0])
-            err = np.zeros(prob.shape[0])
-            fig = plt.figure()
-            ax = fig.add_subplot(111)
-
-            for i, (current_prob, current_loc) in enumerate(zip(prob, loc)):
-                # compute decoded location using weighted average
-                dec_location = np.average(means, weights=current_prob, axis=1)
-                err[i] = np.linalg.norm(dec_location - current_loc)
-                ax.scatter(dec_location[0], dec_location[1], color="blue", label="DECODED")
-                ax.scatter(current_loc[0], current_loc[1], color=col_map_red[i], label="TRUE")
-                ax.plot([dec_location[0], current_loc[0]], [dec_location[1], current_loc[1]], color="gray",
-                         zorder=-1000, label="ERRORS")
-                for gl in goal_loc:
-                    if np.linalg.norm(current_loc - gl) < 20:
-                        close_to_goal[i] = 1
-                        ax.scatter(current_loc[0], current_loc[1], facecolors='none', edgecolors="white", label="CLOSE TO GOAL LOC.")
-            handles, labels = ax.get_legend_handles_labels()
-            by_label = OrderedDict(zip(labels, handles))
-            ax.legend(by_label.values(), by_label.keys())
-            plt.title("DECODING USING WEIGHTED MODE MEANS")
-            plt.xlabel("X")
-            plt.ylabel("Y")
-            plt.show()
-            # err = moving_average(a = np.array(err), n=20)
-            plt.plot(err, color="gray", label="ERROR")
-            err = moving_average(a=np.array(err), n=20)
-            plt.plot(err, color="lightcoral", label="ERROR SMOOTHED")
-            plt.plot(close_to_goal*10, color="w", label="CLOSE TO GOAL LOC.")
-            plt.ylabel("ERROR / cm")
-            plt.xlabel("TIME BIN")
-            plt.legend()
-            plt.show()
-
-            sequence = model.decode(raster.T, algorithm="map")[1]
-
-            err = []
-            close_to_goal=np.zeros(sequence.shape[0])
-            fig = plt.figure()
-            ax = fig.add_subplot(111)
-            # compute error
-            for i, (mode_act, current_loc) in enumerate(zip(sequence, loc)):
-                ax.scatter(means[0,mode_act], means[1,mode_act], color="blue", label="DECODED")
-                ax.scatter(current_loc[0], current_loc[1], color=col_map_red[i], label="TRUE")
-                ax.plot([means[0,mode_act], current_loc[0]], [means[1,mode_act], current_loc[1]], color="gray",
-                         zorder=-1000, label="ERROR")
-                err.append(np.linalg.norm(means[:,mode_act]-current_loc))
-                for gl in goal_loc:
-                    if np.linalg.norm(current_loc - gl) < 20:
-                        close_to_goal[i] = 1
-                        ax.scatter(current_loc[0], current_loc[1], facecolors='none', edgecolors="white", label="CLOSE TO GOAL LOC.")
-
-            handles, labels = ax.get_legend_handles_labels()
-            by_label = OrderedDict(zip(labels, handles))
-            ax.legend(by_label.values(), by_label.keys())
-            plt.title("DECODING USING MOST LIKELY MODE SEQUENCE")
-            plt.xlabel("X")
-            plt.ylabel("Y")
-            plt.show()
-            # err = moving_average(a = np.array(err), n=20)
-            plt.plot(err, color="gray", label="ERROR")
-            err = moving_average(a=np.array(err), n=20)
-            plt.plot(err, color="lightcoral", label="ERROR SMOOTHED")
-            plt.plot(close_to_goal*10, color="w", label="CLOSE TO GOAL LOC.")
-            plt.legend()
-            plt.ylabel("ERROR / cm")
-            plt.xlabel("TIME BIN")
-            plt.show()
-
-            mean_err = []
-            median_err = []
-
-            for trial_to_decode in trials_to_use:
-                raster = self.trial_raster_list[trial_to_decode]
-                loc = self.trial_loc_list[trial_to_decode]
-                prob = model.predict_proba(raster.T)
-                err = []
-                for i, (current_prob, current_loc) in enumerate(zip(prob, loc)):
-                    # compute decoded location using weighted average
-                    dec_location = np.average(means, weights=current_prob, axis=1)
-                    err.append(np.linalg.norm(dec_location - current_loc))
-
-                mean_err.append(np.mean(np.array(err)))
-                median_err.append(np.median(np.array(err)))
-
-            plt.plot(trials_to_use, mean_err, label="MEAN")
-            plt.plot(trials_to_use, median_err, label="MEDIAN")
-            plt.ylabel("ERROR / cm")
-            plt.xlabel("TRIAL ID")
-            plt.ylim(10,40)
-            plt.legend()
-            plt.show()
-
-    def decode_location_ising(self, trial_to_decode, model_name=None, trials_to_use=None):
-        """
-        decodes awake activity using spatial bins from ising model from same experiment phase
-
-        @param trial_to_decode: which trial to decode
-        @type trial_to_decode: int
-        @param model_name: name of file containing the pHMM file
-        @type model_name: str
-        @param plot_for_control: plots intermediate results if True
-        @type plot_for_control: bool
-        @param return_results: whether to return results or not
-        @type return_results: bool
-        @return: pre_prob (probabilities of PRE), post_prob (probabilities of ), event_times (in sec),
-        swr_in_which_n_rem (assignement SWR - nrem phase)
-        @rtype: list, list, list, numpy.array
-        """
-
-        print(" - DECODE LOCATION USING ISING ...\n")
-
-        # get template file name from parameter file of session if not provided
-        if model_name is None:
-            model_name = self.params.default_pre_ising_model
-
-        if model_name is None:
-            raise Exception("MODEL FILE NOT FOUND\n NOR IN SESSION PARAMETER FILE DEFINED")
-
-        if trials_to_use is None:
-            trials_to_use = self.default_trials
-
-        print("   --> USING TRIALS: "+str(trials_to_use[0])+"-"+str(trials_to_use[-1])+"\n")
-
-        # check that template files are from correct session
-        # --------------------------------------------------------------------------------------------------------------
-        sess_pre = model_name.split(sep="_")[0]+"_"+model_name.split(sep="_")[1]
-
-        if not (sess_pre == self.params.session_name):
-            raise Exception("TEMPLATE FILE AND CURRENT SESSION DO NOT MATCH!")
-
-            # load ising template
-        with open(self.params.pre_proc_dir + 'awake_ising_maps/' + model_name + '.pkl',
-                  'rb') as f:
-            model_dic = pickle.load(f)
-
-        # load goal locations
-        goal_loc = np.loadtxt(self.params.pre_proc_dir+"goal_locations"+"/"+"mjc163R2R_0114_11.gcoords")
-
-        # get location data and raster from trial
-        raster = self.trial_raster_list[trial_to_decode]
-        loc = self.trial_loc_list[trial_to_decode]
-
-        # decode activity
-        # get template map
-        template_map = model_dic["res_map"]
-
-        # need actual spatial bin position to do decoding
-        bin_size_x = np.round((self.x_max - self.x_min)/template_map.shape[1], 0)
-        bins_x = np.linspace(self.x_min+bin_size_x/2, self.x_max-bin_size_x/2, template_map.shape[1])
-        # bins_x = np.repeat(bins_x[None, :], template_map.shape[2], axis=0)
-
-        # bins_x = bins_x.reshape(-1, (template_map.shape[1] * template_map.shape[2]))
-
-        bin_size_y = np.round((self.y_max - self.y_min)/template_map.shape[2], 0)
-        bins_y = np.linspace(self.y_min+bin_size_y/2, self.y_max-bin_size_y/2, template_map.shape[2])
-        # bins_y = np.repeat(bins_y[:, None], template_map.shape[1], axis=1)
-
-        # bins_y = bins_y.reshape(-1, (template_map.shape[1] * template_map.shape[2]))
-
-        prob = decode_using_ising_map(template_map=template_map,
-                                              event_spike_rasters=[raster],
-                                              compression_factor=10,
-                                              cell_selection="all")[0]
-
-
-        # prob_poiss_norm = prob_poiss / np.sum(prob_poiss, axis=1, keepdims=True)
-
-        # plt.imshow(prob_poiss_norm, interpolation='nearest', aspect='auto')
-        # plt.show()
-        # plt.imshow(np.log(prob_poiss), interpolation='nearest', aspect='auto')
-        # plt.show()
-
-        col_map_red = cm.Reds(np.linspace(0, 1, prob.shape[0]))
-        close_to_goal=np.zeros(prob.shape[0])
-        err = np.zeros(prob.shape[0])
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-
-        for i, (current_prob, current_loc) in enumerate(zip(prob, loc)):
-
-            prob_map = current_prob.reshape(template_map.shape[1],template_map.shape[2])
-            max_ind = np.unravel_index(prob_map.argmax(), prob_map.shape)
-            # plt.imshow(prob_map.T, origin="lower")
-            # plt.colorbar()
-            # plt.show()
-            # compute decoded location using weighted average
-            dec_location_x = bins_x[max_ind[0]]
-            dec_location_y = bins_y[max_ind[1]]
-            dec_location = np.array([dec_location_x, dec_location_y])
-            err[i] = np.linalg.norm(dec_location - current_loc)
-            ax.scatter(dec_location[0], dec_location[1], color="blue", label="DECODED")
-            ax.scatter(current_loc[0], current_loc[1], color=col_map_red[i], label="TRUE")
-            ax.plot([dec_location[0], current_loc[0]], [dec_location[1], current_loc[1]], color="gray",
-                     zorder=-1000, label="ERRORS")
-            for gl in goal_loc:
-                if np.linalg.norm(current_loc - gl) < 20:
-                    close_to_goal[i] = 1
-                    ax.scatter(current_loc[0], current_loc[1], facecolors='none', edgecolors="white", label="CLOSE TO GOAL LOC.")
-        handles, labels = ax.get_legend_handles_labels()
-        by_label = OrderedDict(zip(labels, handles))
-        ax.legend(by_label.values(), by_label.keys())
-        plt.title("BAYESIAN DECODING")
-        plt.xlabel("X")
-        plt.ylabel("Y")
-        plt.show()
-        # err = moving_average(a = np.array(err), n=20)
-        plt.plot(err, color="gray", label="ERROR")
-        err = moving_average(a=np.array(err), n=20)
-        plt.plot(err, color="lightcoral", label="ERROR SMOOTHED")
-        plt.plot(close_to_goal*10, color="w", label="CLOSE TO GOAL LOC.")
-        plt.ylabel("ERROR / cm")
-        plt.xlabel("TIME BIN")
-        plt.legend()
-        plt.show()
-
-
-        mean_err = []
-        median_err = []
-
-        for trial_to_decode in trials_to_use:
-            raster = self.trial_raster_list[trial_to_decode]
-            loc = self.trial_loc_list[trial_to_decode]
-            prob = decode_using_ising_map(template_map=template_map,
-                                          event_spike_rasters=[raster],
-                                          compression_factor=10,
-                                          cell_selection="all")[0]
-            err = []
-            for i, (current_prob, current_loc) in enumerate(zip(prob, loc)):
-                # compute decoded location using weighted average
-                prob_map = current_prob.reshape(template_map.shape[1], template_map.shape[2])
-                max_ind = np.unravel_index(prob_map.argmax(), prob_map.shape)
-                # plt.imshow(prob_map.T, origin="lower")
-                # plt.colorbar()
-                # plt.show()
-                # compute decoded location using weighted average
-                dec_location_x = bins_x[max_ind[0]]
-                dec_location_y = bins_y[max_ind[1]]
-                dec_location = np.array([dec_location_x, dec_location_y])
-                err.append(np.linalg.norm(dec_location - current_loc))
-
-            mean_err.append(np.mean(np.array(err)))
-            median_err.append(np.median(np.array(err)))
-
-        plt.plot(trials_to_use, mean_err, label="MEAN")
-        plt.plot(trials_to_use, median_err, label="MEDIAN")
-        plt.ylabel("ERROR / cm")
-        plt.xlabel("TRIAL ID")
-        plt.legend()
-        plt.show()
-
-    def decode_location_bayes(self, cell_subset=None, trials_train=None, trials_test=None, save_fig=False,
-                              plotting=False):
-        """
-        Location decoding using Bayes
-
-        :param trials_train: trials used to generate rate maps
-        :type trials_train: iterable
-        :param trials_test: trials used for testing (pop.vec. & location)
-        :type trials_test: iterable
-        :param save_fig: whether to save figure or not
-        :type save_fig: bool
-        :param plotting: whether to plot results or return results (error)
-        :type plotting: bool
-        :param cell_subset: subset of cells that is used for decoding
-        :type cell_subset: array
-        """
-        print(" - DECODING LOCATION USING BAYESIAN ...\n")
-
-        # if no trials are provided: train/test on default trials without cross-validation
-        if trials_train is None:
-            trials_train = self.default_trials
-        if trials_test is None:
-            trials_test = self.default_trials
-
-        # get train data --> rate maps
-        # --------------------------------------------------------------------------------------------------------------
-        rate_maps = self.get_rate_maps(spatial_resolution=1, trials_to_use=trials_train)
-
-        if cell_subset is not None:
-            rate_maps = rate_maps[:, :, cell_subset]
-
-        # flatten rate maps
-        rate_maps_flat = np.reshape(rate_maps, (rate_maps.shape[0] * rate_maps.shape[1], rate_maps.shape[2]))
-
-        # get test data --> population vectors and location
-        # --------------------------------------------------------------------------------------------------------------
-        raster = []
-        loc = []
-        for trial_id in trials_test:
-            raster.append(self.trial_raster_list[trial_id])
-            loc.append(self.trial_loc_list[trial_id])
-
-        loc = np.vstack(loc)
-        raster = np.hstack(raster)
-
-        if cell_subset is not None:
-            raster = raster[cell_subset, :]
-
-        if plotting or save_fig:
-            plt.style.use('default')
-            fig = plt.figure()
-            ax = fig.add_subplot(111)
-
-        decoding_err = []
-        for i, (pop_vec, current_loc) in enumerate(zip(raster.T, loc)):
-            if np.count_nonzero(pop_vec) == 0:
-                continue
-            bl = bayes_likelihood(frm=rate_maps_flat.T, pop_vec=pop_vec, log_likeli=False)
-            bl_area = np.reshape(bl, (rate_maps.shape[0], rate_maps.shape[1]))
-            pred_bin = np.unravel_index(bl_area.argmax(), bl_area.shape)
-            pred_x = pred_bin[0] + self.x_min
-            pred_y = pred_bin[1] + self.y_min
-            dec_location = np.array([pred_x, pred_y])
-            decoding_err.append(np.sqrt((pred_x - current_loc[0]) ** 2 + (pred_y - current_loc[1]) ** 2))
-
-            if plotting or save_fig:
-                ax.scatter(dec_location[0], dec_location[1], color="red", label="Decoded locations")
-                ax.scatter(current_loc[0], current_loc[1], color="lightgray", label="True locations")
-
-        if plotting or save_fig:
-            for g_l in self.goal_locations:
-                ax.scatter(g_l[0], g_l[1], color="black", label="Goals", marker="x")
-            handles, labels = ax.get_legend_handles_labels()
-            by_label = OrderedDict(zip(labels, handles))
-            ax.legend(by_label.values(), by_label.keys())
-            plt.title("Bayesian decoding")
-            plt.xlabel("X (cm)")
-            plt.ylabel("Y (cm)")
-            plt.ylim(10, 110)
-            plt.xlim(30, 140)
-            if save_fig:
-                plt.rcParams['svg.fonttype'] = 'none'
-                plt.savefig("decoded_locations_bayes.svg", transparent="True")
-                plt.close()
-            else:
-                plt.show()
-
-            decoding_err = np.array(decoding_err)
-            plt.hist(decoding_err, density=True, color="indianred", bins=int(decoding_err.shape[0]/5))
-            plt.title("Decoding error")
-            plt.xlabel("Error (cm)")
-            plt.ylabel("Density")
-            plt.xlim(-5, 100)
-            if save_fig:
-                plt.rcParams['svg.fonttype'] = 'none'
-                plt.savefig("decoding_error_bayes.svg", transparent="True")
-            else:
-                plt.show()
-
-        if (not plotting) & (not save_fig):
-            return decoding_err
 
     def compare_decoding_location_phmm_bayesian(self):
 
@@ -12926,9 +12954,157 @@ class Cheeseboard:
 
 
 """#####################################################################################################################
+#   CROSS-MAZE TASK
+#####################################################################################################################"""
+
+
+class CrossMaze(TrialParentClass):
+    """Class for cross-maze task data analysis
+
+       ATTENTION: this is only used for the task data --> otherwise use Sleep class!
+
+    """
+
+    def __init__(self, data_dic, cell_type, params, session_params, experiment_phase=None):
+        """
+        initializes cheeseboard class
+
+        :param data_dic: dictionary containing spike data
+        :type data_dic: python dic
+        :param cell_type: which cell type to use
+        :type cell_type: str
+        :param params: general analysis params
+        :type params: class
+        :param session_params: sessions specific params
+        :type session_params: class
+        :param exp_phase_id: which experiment phase id
+        :type exp_phase_id: int
+        """
+
+        # get attributes from parent class
+        TrialParentClass.__init__(self, data_dic, cell_type, params, session_params, experiment_phase)
+
+        # select all trials by default
+        self.default_trials = range(self.data_dic["timestamps"].shape[0])
+
+        # --------------------------------------------------------------------------------------------------------------
+        # compute raster, location speed per trial
+        # --------------------------------------------------------------------------------------------------------------
+        self.trial_loc_list = []
+        self.trial_raster_list = []
+        self.trial_speed_list = []
+
+        # go trough all trials
+        for trial_id, key in enumerate(self.data_dic["trial_data"]):
+            # check if two cell-types were provided --> will be combined
+            if isinstance(cell_type, list) and len(cell_type) > 1:
+                raster = []
+                for ct in cell_type:
+                    raster_cell_type, loc, speed = PreProcessAwake(
+                        firing_times=self.data_dic["trial_data"][key]["spike_times"][ct],
+                        params=self.params, whl=self.data_dic["trial_data"][key]["whl"],
+                        spatial_factor=self.spatial_factor
+                        ).interval_temporal_binning_raster_loc_vel(
+                        interval_start=self.data_dic["timestamps"][trial_id, 0],
+                        interval_end=self.data_dic["timestamps"][trial_id, 4])
+                    raster.append(raster_cell_type)
+                raster = np.vstack(raster)
+            else:
+                raster, loc, speed = PreProcessAwake(firing_times=self.data_dic["trial_data"][key]["spike_times"][cell_type],
+                                                     params=self.params, whl=self.data_dic["trial_data"][key]["whl"],
+                                                     spatial_factor=self.spatial_factor
+                                                     ).interval_temporal_binning_raster_loc_vel(
+                    interval_start=self.data_dic["timestamps"][trial_id, 0],
+                    interval_end=self.data_dic["timestamps"][trial_id, 4])
+
+            # update environment dimensions
+            self.x_min = min(self.x_min, min(loc[:,0]))
+            self.x_max = max(self.x_max, max(loc[:, 0]))
+            self.y_min = min(self.y_min, min(loc[:,1]))
+            self.y_max = max(self.y_max, max(loc[:, 1]))
+
+
+            self.trial_raster_list.append(raster)
+            self.trial_loc_list.append(loc)
+            self.trial_speed_list.append(speed)
+
+
+"""#####################################################################################################################
 #   BASE CLASS TWO POPULATIONS
 #####################################################################################################################"""
 
+
+class BaseClassTwoPop:
+    """Base class for data analysis of two populations"""
+
+    def __init__(self, data_dic, cell_type_1, cell_type_2, params, session_params, experiment_phase):
+        self.cell_type_1 = cell_type_1
+        self.cell_type_2 = cell_type_2
+        self.params = params
+
+        self.nr_cell_type_1 = None
+        self.nr_cell_type_2 = None
+
+        self.session_params = session_params
+        self.data_dic = data_dic
+
+"""#####################################################################################################################
+#   SLEEP CLASS TWO POPULATIONS
+#####################################################################################################################"""
+
+
+class TwoPopSleep(BaseClassTwoPop):
+    """Class for cross-maze task data analysis
+
+       ATTENTION: this is only used for the task data --> otherwise use Sleep class!
+
+    """
+
+    def __init__(self, data_dic, cell_type_1, cell_type_2, session_params, params, experiment_phase):
+        """
+        initializes cheeseboard class
+
+        :param data_dic: dictionary containing spike data
+        :type data_dic: python dic
+        :param cell_type_1: which cell type to use
+        :type cell_type_1: str
+        :param cell_type_2: which cell type to use
+        :type cell_type_2: str
+        :param params: general analysis params
+        :type params: class
+        :param session_params: sessions specific params
+        :type session_params: class
+        :param exp_phase_id: which experiment phase id
+        :type exp_phase_id: int
+        """
+
+        if isinstance(cell_type_1, list) and len(cell_type_1) == 1:
+            cell_type_1 = cell_type_1[0]
+        if isinstance(cell_type_2, list) and len(cell_type_2) == 1:
+            cell_type_2 = cell_type_2[0]
+
+        # get attributes from parent class
+        BaseClassTwoPop.__init__(self, data_dic, cell_type_1, cell_type_2, params, session_params, experiment_phase)
+
+        self.pop_1 = Sleep(data_dic=data_dic, cell_type=cell_type_1, params=params, session_params=session_params,
+                           experiment_phase=experiment_phase)
+        self.pop_2 = Sleep(data_dic=data_dic, cell_type=cell_type_2, params=params, session_params=session_params,
+                           experiment_phase=experiment_phase)
+
+    def plot_rasters(self):
+        self.pop_1.view_raster()
+        self.pop_2.view_raster()
+
+    def get_rasters(self):
+        return self.pop_1.get_raster(), self.pop_2.get_raster()
+
+
+
+
+
+"""#####################################################################################################################
+#   BASE METHODS TWO POPULATIONS --> delete when all methods are copied to the above
+#####################################################################################################################"""
 
 class BaseMethodsTwoPop:
     """Base class for general electro physiological data analysis of two popoulations"""
@@ -12944,30 +13120,6 @@ class BaseMethodsTwoPop:
 
     """#################################################################################################################
     #   helper functions
-    #################################################################################################################"""
-
-    def get_nr_cells(self):
-        # --------------------------------------------------------------------------------------------------------------
-        # get nr of cells in first population
-        # --------------------------------------------------------------------------------------------------------------
-        return self.nr_cells_pop_1, self.nr_cells_pop_2
-
-    def get_rasters(self):
-        # --------------------------------------------------------------------------------------------------------------
-        # return binned maps of both populations
-        # --------------------------------------------------------------------------------------------------------------
-
-        return self.cell_type_array, self.raster_list
-
-    def view_rasters(self):
-        # --------------------------------------------------------------------------------------------------------------
-        # plots rasters from both populations
-        # --------------------------------------------------------------------------------------------------------------
-        for i, raster in enumerate(self.raster_list):
-            plot_act_mat(raster, self.params, self.cell_type_array[i])
-
-    """#################################################################################################################
-    #   basic statistics
     #################################################################################################################"""
 
     def firing_rate_hist(self):
@@ -15598,77 +15750,5 @@ class BaseMethodsTwoPop:
         plt.ylabel("COUNTS")
         plt.hist(D.flatten(), bins=100, log=True)
         plt.show()
-
-
-"""#####################################################################################################################
-#   CLASS FOR TWO POPULATION SLEEP DATA
-#####################################################################################################################"""
-
-
-class TwoPopSleep(BaseMethodsTwoPop):
-    """class for sleep analysis of two populations"""
-
-    def __init__(self, sleep_dic, cell_type_array, params):
-
-        # get attributes from parent class
-        BaseMethodsTwoPop.__init__(self, cell_type_array, params)
-
-        self.sleep_type = params.sleep_type
-
-        for cell_type in cell_type_array:
-            # get
-            new_sleep = Sleep(sleep_dic, cell_type, self.params)
-            self.raster_list.append(new_sleep.get_raster())
-
-        self.nr_cells_pop_1 = self.raster_list[0].shape[0]
-        self.nr_cells_pop_2 = self.raster_list[1].shape[0]
-
-        print(" - CELLS IN POPULATION "+self.cell_type_array[0]+": " + str(self.nr_cells_pop_1))
-        print(" - CELLS IN POPULATION "+self.cell_type_array[1]+": " + str(self.nr_cells_pop_2))
-        print("\n")
-
-
-"""#####################################################################################################################
-#   CLASS FOR TWO POPULATION EXPLORATION DATA
-#####################################################################################################################"""
-
-
-class TwoPopExploration(BaseMethodsTwoPop):
-    """class for sleep analysis of two populations"""
-
-    def __init__(self, data_dic, cell_type_array, params):
-
-        # get attributes from parent class
-        BaseMethodsTwoPop.__init__(self, cell_type_array, params)
-
-        self.data_dic = data_dic
-        self.saving_dir = params.saving_dir_maps
-        self.params = params
-        self.rate_map_list = []
-        self.cell_type_array = cell_type_array
-        self.exploration_objects = []
-
-        # get raster data for different populations
-        for i, cell_type in enumerate(cell_type_array):
-            # compute raster data
-            new_exploration = Exploration(data_dic, cell_type, self.params)
-            self.exploration_objects.append(new_exploration)
-            # only need to get location and velocity once (not dependent on population)
-            if not i:
-                raster, self.loc, self.vel = new_exploration.get_raster_loc_vel()
-            else:
-                raster, _, _ = new_exploration.get_raster_loc_vel()
-            self.raster_list.append(raster)
-
-        self.nr_cells_pop_1 = self.raster_list[0].shape[0]
-        self.nr_cells_pop_2 = self.raster_list[1].shape[0]
-
-    def get_rate_maps(self):
-        for cell_type in self.cell_type_array.cell_type_array:
-            # get rate maps for different populations
-            new_exploration = Exploration(self.data_dic, cell_type, self.params)
-            self.rate_map_list.append(new_exploration.get_rate_maps())
-        return self.rate_map_list
-
 
 
